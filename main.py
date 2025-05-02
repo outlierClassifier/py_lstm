@@ -132,6 +132,25 @@ async def train_model(request: TrainingRequest):
     
     start_execution = time.time()
     
+    # Idea general
+    # 1. Escalar las 7 features de cada discharge (normalizar) con MinMaxScaler
+    # 2. Crear ventanas deslizantes de 500 muestras
+    # 3. Crear un array de numpy con las ventanas y otro con los labels (1 si es anomalia, 0 si no).
+    #    Todas las ventanas de la misma descarga tienen el mismo label.
+    # 4. Los datos que tendremos son:
+    #    - 7 features (las 7 señales) por ventana
+    #    - Unas 10k / tamano de ventana (500) = 20 ventanas por descarga
+    #    - 6 descargas por entrenamiento: 120 ventanas
+    # 5. Arquitectura LSTM:
+    #    - Tenemos pocas ventanas -> Probablemente una capa
+    #    - Units: 32 o 64 (no muchas)
+    #    - Dropout: 0.2 o 0.3 (no muchas ventanas)
+    #    - Dense: 1 (sigmoid) -> 0 o 1 (anomalía o no)
+    #    - Optimizer: Adam (learning rate 0.001)
+    #    - Epochs: 200
+    #    - Batch size: 32 - 64
+    #    - Loss: binary_crossentropy
+
     try:
         # Extract features and labels from training data
         X = []
