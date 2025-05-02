@@ -1,10 +1,12 @@
 import re
 from fastapi import FastAPI, HTTPException, Request
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, LSTM, Dropout
 import uvicorn
 import numpy as np
+import tensorflow as tf
+import pandas as pd
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 import time
@@ -91,16 +93,21 @@ app = FastAPI(
 
 # Global variables
 MODEL_PATH = "lstm_model.h5"
+SCALER_PATH = "scaler.pkl"
 start_time = time.time()
 last_training_time = None
 model = None
+scaler = None
 
-# Load model if exists
+# Load model and scaler if they exist
 if os.path.exists(MODEL_PATH):
     try:
         model = pickle.load(open(MODEL_PATH, "rb"))
         logger.info("Existing model loaded successfully")
-
+        
+        if os.path.exists(SCALER_PATH):
+            scaler = pickle.load(open(SCALER_PATH, "rb"))
+            logger.info("Existing scaler loaded successfully")
     except Exception as e:
         logger.error(f"Error loading model: {str(e)}")
 
@@ -137,7 +144,7 @@ def sliding_normalized_windows(discharges: list[Discharge], window_size: int, ov
             for d in discharges
         ]).reshape(-1, 1)
 
-        scaler = MinMaxScaler()
+        scaler = StandardScaler()
         scaler.fit(all_values)
         scalers[sid] = scaler
 
@@ -176,45 +183,208 @@ def is_anomaly(discharge: Discharge) -> bool:
     """Determine if a discharge has an anomaly based on anomalyTime"""
     return discharge.anomalyTime is not None
 
+def prepare_features_for_lstm(discharges: List[Discharge]):
+    """
+    Extract and prepare features for LSTM model based on the old model's approach.
+    
+    Args:
+        discharges: List of Discharge objects
+        
+    Returns:
+        X_lstm: Feature matrix reshaped for LSTM
+        y: Target labels
+        scaler: Fitted StandardScaler for future use
+    """
+    X = []
+    y = []
+    
+    for discharge in discharges:
+        # Create dictionary of signal data by sensor ID
+        feature_data = {}
+        for signal in discharge.signals:
+            sensor_id = get_sensor_id(signal)
+            # Convert to pandas Series for easy statistical calculations
+            feature_data[int(sensor_id)] = {
+                'value': pd.Series(signal.values)
+            }
+        
+        # Extract features from each signal
+        feature_vector = []
+        for feature_num, feature_data in feature_data.items():
+            # Simple features: mean, std, min, max, etc.
+            feature_vector.extend([
+                feature_data['value'].mean(),
+                feature_data['value'].std() if len(feature_data['value']) > 1 else 0,  # Handle single value case
+                feature_data['value'].min(),
+                feature_data['value'].max(),
+                feature_data['value'].skew() if len(feature_data['value']) > 2 else 0,  # Handle small sample case
+                feature_data['value'].kurtosis() if len(feature_data['value']) > 3 else 0  # Handle small sample case
+            ])
+        
+        X.append(feature_vector)
+        y.append(1 if discharge.anomalyTime is not None else 0)
+    
+    # Convert to numpy arrays
+    X = np.array(X)
+    y = np.array(y)
+    
+    # Scale the features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Reshape for LSTM: [samples, time steps, features]
+    X_lstm = np.reshape(X_scaled, (X_scaled.shape[0], 1, X_scaled.shape[1]))
+    
+    return X_lstm, y, scaler
+
+def prepare_features_for_prediction(discharges: List[Discharge], scaler: StandardScaler):
+    """
+    Prepare features for prediction using the old model's approach.
+    
+    Args:
+        discharges: List of Discharge objects
+        scaler: Fitted StandardScaler
+        
+    Returns:
+        X_lstm: Feature matrix reshaped for LSTM
+    """
+    X = []
+    
+    for discharge in discharges:
+        # Create dictionary of signal data by sensor ID
+        feature_data = {}
+        for signal in discharge.signals:
+            sensor_id = get_sensor_id(signal)
+            # Convert to pandas Series for easy statistical calculations
+            feature_data[int(sensor_id)] = {
+                'value': pd.Series(signal.values)
+            }
+        
+        # Extract features from each signal
+        feature_vector = []
+        for feature_num, feature_data in feature_data.items():
+            # Simple features: mean, std, min, max, etc.
+            feature_vector.extend([
+                feature_data['value'].mean(),
+                feature_data['value'].std() if len(feature_data['value']) > 1 else 0,  # Handle single value case
+                feature_data['value'].min(),
+                feature_data['value'].max(),
+                feature_data['value'].skew() if len(feature_data['value']) > 2 else 0,  # Handle small sample case
+                feature_data['value'].kurtosis() if len(feature_data['value']) > 3 else 0  # Handle small sample case
+            ])
+        
+        X.append(feature_vector)
+    
+    # Convert to numpy array
+    X = np.array(X)
+    
+    # Scale the features
+    X_scaled = scaler.transform(X)
+    
+    # Reshape for LSTM: [samples, time steps, features]
+    X_lstm = np.reshape(X_scaled, (X_scaled.shape[0], 1, X_scaled.shape[1]))
+    
+    return X_lstm
+
+def train_lstm_model(X_train, y_train, options: Optional[TrainingOptions] = None):
+    """
+    Train the LSTM model using the old model's architecture.
+    
+    Args:
+        X_train: Training feature matrix (reshaped for LSTM)
+        y_train: Training labels
+        options: Training options from API request
+        
+    Returns:
+        Trained LSTM model and training metrics
+    """
+    # Set parameters based on options or defaults
+    params = {
+        'layer1_units': 64,
+        'layer2_units': 32,
+        'dropout_rate': 0.2,
+        'learning_rate': 0.004,
+        'batch_size': 32,
+        'epochs': 150
+    }
+    
+    # Override with user-provided options if available
+    if options:
+        if options.epochs:
+            params['epochs'] = options.epochs
+        if options.batchSize:
+            params['batch_size'] = options.batchSize
+        if options.hyperparameters:
+            for key, value in options.hyperparameters.items():
+                if key in params:
+                    params[key] = value
+    
+    # Log LSTM parameters
+    logger.info("LSTM Network Parameters:")
+    logger.info(f"  - layer1_units: {params['layer1_units']}")
+    logger.info(f"  - layer2_units: {params['layer2_units']}")
+    logger.info(f"  - dropout_rate: {params['dropout_rate']}")
+    logger.info(f"  - learning_rate: {params['learning_rate']}")
+    logger.info(f"  - batch_size: {params['batch_size']}")
+    logger.info(f"  - epochs: {params['epochs']}")
+    
+    # LSTM model for binary classification
+    model = Sequential([
+        LSTM(params['layer1_units'], input_shape=(1, X_train.shape[2]), return_sequences=True),
+        Dropout(params['dropout_rate']),
+        LSTM(params['layer2_units']),
+        Dense(16, activation='relu'),
+        Dense(1, activation='sigmoid')
+    ])
+    
+    # Use Adam optimizer with custom learning rate
+    optimizer = tf.keras.optimizers.Adam(learning_rate=params['learning_rate'])
+    
+    model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+    
+    history = model.fit(
+        X_train, y_train, 
+        epochs=params['epochs'], 
+        batch_size=params['batch_size'], 
+        verbose=1, 
+        validation_split=0.2
+    )
+    
+    # Extract metrics from training history
+    metrics = {
+        'accuracy': float(history.history['accuracy'][-1]),
+        'loss': float(history.history['loss'][-1]),
+        'val_accuracy': float(history.history['val_accuracy'][-1]) if 'val_accuracy' in history.history else None,
+        'val_loss': float(history.history['val_loss'][-1]) if 'val_loss' in history.history else None
+    }
+    
+    return model, metrics
+
 @app.post("/train", response_model=TrainingResponse)
 async def train_model(request: TrainingRequest):
-    global model, last_training_time
+    global model, scaler, last_training_time
     
     start_execution = time.time()
     
-    # Idea general
-    # 1. Escalar las 7 features de cada discharge (normalizar) con MinMaxScaler
-    # 2. Crear ventanas deslizantes de 500 muestras
-    # 3. Crear un array de numpy con las ventanas y otro con los labels (1 si es anomalia, 0 si no).
-    #    Todas las ventanas de la misma descarga tienen el mismo label.
-    # 4. Los datos que tendremos son:
-    #    - 7 features (las 7 señales) por ventana
-    #    - Unas 10k / tamano de ventana (500) = 20 ventanas por descarga
-    #    - 6 descargas por entrenamiento: 120 ventanas
-    # 5. Arquitectura LSTM:
-    #    - Tenemos pocas ventanas -> Probablemente una capa
-    #    - Units: 32 o 64 (no muchas)
-    #    - Dropout: 0.2 o 0.3 (no muchas ventanas)
-    #    - Dense: 1 (sigmoid) -> 0 o 1 (anomalía o no)
-    #    - Optimizer: Adam (learning rate 0.001)
-    #    - Epochs: 200
-    #    - Batch size: 32 - 64
-    #    - Loss: binary_crossentropy
-
     try:
-        X, y = sliding_normalized_windows(request.discharges, window_size=500, overlap=0.5)
-        logger.info(f"Training data shape: {X.shape}, Labels: {np.sum(y)} anomalies out of {len(y)}")
+        # Prepare features using the old model's approach
+        X_train, y_train, new_scaler = prepare_features_for_lstm(request.discharges)
+        logger.info(f"Training data shape: {X_train.shape}, Labels: {np.sum(y_train)} anomalies out of {len(y_train)}")
         
-        # Define LSTM model
-        model = Sequential()
-        model.add(LSTM(64, input_shape=(X.shape[1], X.shape[2]), return_sequences=False))
-        model.add(Dropout(0.2))
-        model.add(Dense(1, activation='sigmoid'))
-
-        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-
-        model.fit(X, y, epochs=200, batch_size=32, verbose=1)
-
+        # Train model
+        trained_model, metrics = train_lstm_model(X_train, y_train, request.options)
+        model = trained_model
+        scaler = new_scaler
+        
+        # Save the model and scaler
+        with open(MODEL_PATH, "wb") as f:
+            pickle.dump(model, f)
+        with open(SCALER_PATH, "wb") as f:
+            pickle.dump(scaler, f)
+        
+        logger.info(f"Model saved to {MODEL_PATH}")
+        logger.info(f"Scaler saved to {SCALER_PATH}")
+        
         # Calculate execution time
         execution_time = (time.time() - start_execution) * 1000  # ms
         
@@ -225,15 +395,16 @@ async def train_model(request: TrainingRequest):
         with open(MODEL_PATH, "wb") as f:
             pickle.dump(model, f)
         logger.info(f"Model saved to {MODEL_PATH}")
-        
+        last_training_time = datetime.datetime.now().isoformat()
+
         return TrainingResponse(
             status="success",
             message="Training completed successfully",
             trainingId=training_id,
             metrics=TrainingMetrics(
-                accuracy=0.85,  # Placeholder for actual accuracy
-                f1Score=0.8,    # Placeholder for actual F1 score
-                loss=0.1,       # Placeholder for actual loss
+                accuracy=metrics['accuracy'],
+                loss=metrics['loss'],
+                f1Score=metrics['accuracy']  # Approximation, replace with actual F1 if available
             ),
             executionTimeMs=execution_time
         )
@@ -251,11 +422,12 @@ async def train_model(request: TrainingRequest):
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
-    global model
+    global model, scaler
     
     start_execution = time.time()
-    print(f"Received prediction request with {len(request.discharges)} discharges")
-    if model is None:
+    logger.info(f"Received prediction request with {len(request.discharges)} discharges")
+    
+    if model is None or scaler is None:
         raise HTTPException(
             status_code=400,
             detail=ErrorResponse(
@@ -266,29 +438,31 @@ async def predict(request: PredictionRequest):
         )
     
     try:
+        # Prepare features for prediction using the old model's approach
+        X_predict = prepare_features_for_prediction(request.discharges, scaler)
+        logger.info(f"Prediction data shape: {X_predict.shape}")
+        
+        # Make predictions
+        raw_predictions = model.predict(X_predict)
+        binary_predictions = (raw_predictions > 0.5).astype(int).flatten()
+        
+        # Calculate final prediction and confidence
+        avg_prediction = float(np.mean(raw_predictions))
+        final_prediction = 1 if avg_prediction > 0.5 else 0
+        confidence = avg_prediction if final_prediction == 1 else 1 - avg_prediction
+        
+        # Calculate execution time
         execution_time = (time.time() - start_execution) * 1000  # ms
         
-        X, _ = sliding_normalized_windows(request.discharges, window_size=500, overlap=0.5)
-        logger.info(f"Prediction data shape: {X.shape}")
-    
-        predictions = []
-        for i in range(X.shape[0]):
-            prediction = model.predict(X[i:i+1])
-            predictions.append(prediction[0][0])
-
-        prediction = 1 if np.mean(predictions) > 0.5 else 0
-        confidence = np.mean(predictions) if prediction == 1 else 1 - np.mean(predictions)
-
         return PredictionResponse(
-            prediction=prediction,
+            prediction=int(final_prediction),
             confidence=float(confidence),
             executionTimeMs=execution_time,
             model="lstm",
             details={
-                "individualPredictions": [],
-                "individualConfidences": 0.4,
-                "numDischargesProcessed": len(request.discharges),
-                "featureImportance": 0
+                "individualPredictions": binary_predictions.tolist(),
+                "individualConfidences": raw_predictions.flatten().tolist(),
+                "numDischargesProcessed": len(request.discharges)
             }
         )
         
@@ -330,42 +504,15 @@ async def increase_json_size_limit(request: Request, call_next):
     return response
 
 if __name__ == "__main__":
-    # discharge1 = Discharge(
-    #     id="DES_1",
-    #     signals=[
-    #         Signal(fileName="DES_1_1", values=[1, 2, 3], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_2", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_3", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_4", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_5", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_6", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_7", values=[7, 8, 9], times=[1, 2, 3]),
-    #     ],
-    #     anomalyTime=1.5
-    # )
-    # discharge2 = Discharge(
-    #     id="DES_2",
-    #     signals=[
-    #         Signal(fileName="DES_2_1", values=[3, 4, 5], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_2", values=[3, 2, 1], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_3", values=[4, 5, 6], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_4", values=[7, 8, 9], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_5", values=[7, 8, 9], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_6", values=[7, 8, 9], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_7", values=[7, 8, 9], times=[1, 2, 3]),
-    #     ],
-    #     anomalyTime=None
-    # )
-    # discharges = [discharge1, discharge2]
-    # X,y = sliding_window(discharges, window_size=2, overlap=0.5)
-
-    # print(f"X: {X}, y: {y}")
-
-    # Try to load the model
+    # Try to load the model and scaler
     if os.path.exists(MODEL_PATH):
         try:
             model = pickle.load(open(MODEL_PATH, "rb"))
             logger.info("Existing model loaded successfully")
+            
+            if os.path.exists(SCALER_PATH):
+                scaler = pickle.load(open(SCALER_PATH, "rb"))
+                logger.info("Existing scaler loaded successfully")
         except Exception as e:
             logger.error(f"Error loading model: {str(e)}")
             model = None
