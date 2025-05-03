@@ -3,6 +3,7 @@ from re import S
 import re
 from typing import Any
 import keras
+import numpy as np
 
 class SignalType(Enum):
     """Enum for signal types."""
@@ -69,6 +70,18 @@ class Discharge:
         self.disruption_class = disruption_class
         self.is_padded = False
         self.is_normalized = False
+
+    def generate_similar_discharges(self, n: int):
+        similar_discharges = []
+        for _ in range(n):
+            new_signals = []
+            for signal in self.signals:
+                new_signal = Signal(signal.label, signal.times, signal.values.copy(), signal.signal_type, signal.disruption_class)
+                new_signal.values = np.random.normal(new_signal.values, 0.1).tolist()
+                new_signals.append(new_signal)
+
+            similar_discharges.append(Discharge(new_signals, self.disruption_class))
+        return similar_discharges
 
 def normalize_vec(list_values: list[Signal]):
     """

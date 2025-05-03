@@ -6,6 +6,7 @@ from tabnanny import verbose
 from turtle import mode
 from fastapi import FastAPI, HTTPException, Request
 from sklearn.preprocessing import MinMaxScaler
+import tensorflow as tf
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.layers import (
     Dense, LSTM, Dropout, Masking, GlobalMaxPooling1D, Flatten, 
@@ -14,6 +15,7 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.regularizers import l2
 import test
 import uvicorn
 import numpy as np
@@ -156,6 +158,16 @@ async def train_model(request: TrainingRequest):
             )
         )
 
+    # Data augmentation
+    if len(discharges) < 10:
+        n_discharges = len(discharges) 
+        i = 0
+        while i < n_discharges:
+            d = discharges[i]
+            extended = d.generate_similar_discharges(5)
+            discharges.extend(extended)
+            i += 1
+
     # Fill with zeros to make all discharges the same length
     # discharges = pad(discharges)
 
@@ -180,28 +192,27 @@ async def train_model(request: TrainingRequest):
         
         # 1. Definicion de la entrada
         inputs = Input(shape=(None, 7), name="input_layer")
-        x = Masking(mask_value=0.0)(inputs)  # Masking layer to ignore padded values
 
         # 2. Capas convolucionales 1D
-        cnn = Conv1D(filters=128, kernel_size=3, padding='same', name="conv1d_layer_1")(x)
+        cnn = Conv1D(filters=128, kernel_size=3, padding='same', name="conv1d_layer_1")(inputs)
         cnn = BatchNormalization(name="bn1")(cnn)
         cnn = Activation('relu', name="act1")(cnn)
 
-        cnn = Conv1D(filters=128, kernel_size=3, padding='same', name="conv1d_layer_2")(cnn)
-        cnn = BatchNormalization(name="bn2")(cnn)
-        cnn = Activation('relu', name="act2")(cnn)
+        # cnn = Conv1D(filters=128, kernel_size=3, padding='same', name="conv1d_layer_2")(cnn)
+        # cnn = BatchNormalization(name="bn2")(cnn)
+        # cnn = Activation('relu', name="act2")(cnn)
 
         # 3. Resumen de la rama CNN
         cnn_branch = GlobalMaxPooling1D(name="global_max_pooling")(cnn)
         
         # 4. Capa LSTM sobre la salida de la CNN
         lstm = LSTM(
-            units=64,
+            units=32,
             dropout=0.2,
             recurrent_dropout=0.2,
+            kernel_regularizer=l2(1e-4),
             name="lstm_layer"
         )(cnn)
-        
 
         # 5. Concatenar la salida de la LSTM con la salida de la CNN
         merged = concatenate([cnn_branch, lstm], name="concat")
@@ -213,7 +224,7 @@ async def train_model(request: TrainingRequest):
         model = Model(inputs, outputs, name="CNN_LSTM_Model")
         
         model.compile(
-            optimizer=Adam(learning_rate=1e-3), 
+            optimizer=Adam(learning_rate=0.01), 
             loss='binary_crossentropy', 
             metrics=['accuracy']
         )
@@ -227,16 +238,8 @@ async def train_model(request: TrainingRequest):
         X_train = np.array([np.array(signal).T for signal in X_train])
         y_train = np.array(y_train)
         
-        max_length = max(len(seq) for seq in X_train)
-                
-        X_train = pad_sequences(
-            X_train, 
-            maxlen=max_length, 
-            padding='post', 
-            dtype='float32',
-            value=0.0
-        )
         # print(f"X_train shape: {X_train.shape}")
+
         # Callbacks para regularizacion y ajuste de learning rate
         callbacks = [
             EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
@@ -262,9 +265,9 @@ async def train_model(request: TrainingRequest):
         training_id = f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         # Save the model
-        with open(MODEL_PATH, "wb") as f:
+        with open("lstm_backup.keras", "wb") as f:
             pickle.dump(model, f)
-        logger.info(f"Model saved to {MODEL_PATH}")
+        logger.info(f"Model saved to lstm_backup.keras")
         
         return TrainingResponse(
             status="success",
@@ -315,7 +318,7 @@ async def predict(request: PredictionRequest):
                         label=signal.fileName,
                         times=signal.times if signal.times else discharge.times,
                         values=signal.values,
-                        signal_type=get_signal_type(get_sensor_id(signal.fileName)),
+                        signal_type=get_signal_type(get_sensor_id(signal)),
                     ))
         
             discharges.append(
@@ -325,10 +328,8 @@ async def predict(request: PredictionRequest):
             )
 
         X_pred, _ = get_X_y(discharges)
-        max_length = max(len(seq) for seq in X_pred)
-        X_pred = pad_sequences(
-            X_pred, maxlen=max_length, padding='post', dtype='float32', value=0.0
-        )
+        X_pred = np.array([np.array(signal).T for signal in X_pred])
+
         # Make predictions
         predictions = model.predict(X_pred, batch_size=2)
         predictions = np.where(predictions > 0.5, 1, 0).flatten()
