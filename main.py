@@ -1,8 +1,20 @@
+import dis
+from gc import callbacks
+from random import shuffle
 import re
+from tabnanny import verbose
+from turtle import mode
 from fastapi import FastAPI, HTTPException, Request
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM, Dropout
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import (
+    Dense, LSTM, Dropout, Masking, GlobalMaxPooling1D, Flatten, 
+    BatchNormalization, Input, Conv1D, Activation, concatenate
+    )
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+import test
 import uvicorn
 import numpy as np
 from typing import List, Dict, Any, Optional
@@ -13,6 +25,7 @@ import os
 import pickle
 import psutil
 import logging
+from signals import Signal as InternalSignal, Discharge as InternalDischarge, DisruptionClass, get_X_y, get_signal_type, pad
 
 PATTERN = "DES_(\\d+)_(\\d+)"
 
@@ -112,65 +125,6 @@ def get_sensor_id(signal: Signal) -> str:
     else:
         raise ValueError(f"Invalid signal file name format: {signal.fileName}")
 
-def sliding_normalized_windows(discharges: list[Discharge], window_size: int, overlap: float):
-    """
-    ## Sliding window function
-    This function takes a list of Discharge objects, normalizes the signals of the same type
-    among all discharges, and creates sliding windows of a specified size with a given overlap.
-
-    :param discharges: List of Discharge objects
-    :param window_size: Size of the sliding window
-    :param overlap: Overlap between windows (0.0 to 1.0)
-    :return: Tuple of numpy arrays (X, y) where X is the input data and y is the labels
-    """
-    step = int(window_size * (1 - overlap))
-
-    sensor_ids = [get_sensor_id(s) for s in discharges[0].signals]
-
-    scalers = {}
-    for sid in sensor_ids:
-        all_values = np.concatenate([
-            np.asarray(
-                [s.values for s in d.signals if get_sensor_id(s) == sid],
-                dtype=np.float32
-            ).ravel()
-            for d in discharges
-        ]).reshape(-1, 1)
-
-        scaler = MinMaxScaler()
-        scaler.fit(all_values)
-        scalers[sid] = scaler
-
-    norm_discharge = []
-    for d in discharges:
-        norm_signals = []
-        for s in d.signals:
-            arr = np.asarray(s.values).reshape(-1, 1)
-            arr_norm = scalers[get_sensor_id(s)].transform(arr).ravel()
-            norm_signals.append({
-                'id': get_sensor_id(s),
-                'values': arr_norm,
-            })
-        norm_discharge.append({
-            'signals': norm_signals,
-            'label': 1 if d.anomalyTime else 0,
-        })
-    
-    X, y = [], []
-    for d in norm_discharge:
-        signals = d['signals']
-        label = d['label']
-        lenght = len(signals[0]['values'])
-        assert all(len(s['values']) == lenght for s in signals), "All signals must have the same length"
-
-        for i in range(0, lenght - window_size + 1, step):
-            window = [s['values'][i:i + window_size] for s in signals]
-            X.append(window)
-            y.append(label)
-
-    X = np.array(X)
-    X = np.transpose(X, (0, 2, 1))  # Change shape to (samples, time steps, features)
-    return X, np.array(y)
 
 def is_anomaly(discharge: Discharge) -> bool:
     """Determine if a discharge has an anomaly based on anomalyTime"""
@@ -182,39 +136,125 @@ async def train_model(request: TrainingRequest):
     
     start_execution = time.time()
     
-    # Idea general
-    # 1. Escalar las 7 features de cada discharge (normalizar) con MinMaxScaler
-    # 2. Crear ventanas deslizantes de 500 muestras
-    # 3. Crear un array de numpy con las ventanas y otro con los labels (1 si es anomalia, 0 si no).
-    #    Todas las ventanas de la misma descarga tienen el mismo label.
-    # 4. Los datos que tendremos son:
-    #    - 7 features (las 7 señales) por ventana
-    #    - Unas 10k / tamano de ventana (500) = 20 ventanas por descarga
-    #    - 6 descargas por entrenamiento: 120 ventanas
-    # 5. Arquitectura LSTM:
-    #    - Tenemos pocas ventanas -> Probablemente una capa
-    #    - Units: 32 o 64 (no muchas)
-    #    - Dropout: 0.2 o 0.3 (no muchas ventanas)
-    #    - Dense: 1 (sigmoid) -> 0 o 1 (anomalía o no)
-    #    - Optimizer: Adam (learning rate 0.001)
-    #    - Epochs: 200
-    #    - Batch size: 32 - 64
-    #    - Loss: binary_crossentropy
+    discharges = []
+    for discharge in request.discharges:
+        signals = []
+        for signal in discharge.signals:
+            signals.append(
+                InternalSignal(
+                    label=signal.fileName,
+                    times=signal.times if signal.times else discharge.times,
+                    values=signal.values,
+                    signal_type=get_signal_type(get_sensor_id(signal)),
+                    disruption_class=DisruptionClass.Anomaly if discharge.anomalyTime else DisruptionClass.Normal
+                ))
+    
+        discharges.append(
+            InternalDischarge(
+                signals=signals, 
+                disruption_class=DisruptionClass.Anomaly if discharge.anomalyTime else DisruptionClass.Normal
+            )
+        )
+
+    # Fill with zeros to make all discharges the same length
+    # discharges = pad(discharges)
 
     try:
-        X, y = sliding_normalized_windows(request.discharges, window_size=500, overlap=0.5)
-        logger.info(f"Training data shape: {X.shape}, Labels: {np.sum(y)} anomalies out of {len(y)}")
+        # Configuración: Combinacion de capas CNN 1D para extraer patrones locales y LSTM para capturar dependencias temporales largas
+        # 1. 2 bloques consecurivos de capas convolucionales 1D con filtros pequeños (128 a 256 filtros de tamaño 3 a 5), cada uno seguido de una capa de Batch Normalization y una capa de activación ReLU. Estas capas aprenden a filtrar ruido y extraer caracteristicas discriminativas a corto plazo.
+        # 2. Una capa LSTM con 64 a 128 unidades, aplicadas sobre las caracteristicas extraidas por las capas convolucionales. Usar `recurrent_dropout` y `dropout` para regularizar. El LSTM aprende patrones temporales a largo plazo.
+        # 3. Concatenacion de las salidas de la capa LSTM con las salidas de las capas convolucionales. Esto permite al modelo aprender tanto patrones locales como temporales.
+        # 4. Capa de salida: una capa densa con activacion sigmoide para clasificar la salida como normal o anomalia. Como funcion de perdida, usar `binary_crossentropy` y como optimizador `adam` con un learning rate de 0.001.
+
+        # El esquema general es: Input (tiempo x 7 señales) -> CNN1D x2 -> LSTM -> Concatenacion -> Dense (1,sigmoide)
+        # Otras opciones son: Usar 3 capas convolucionales 1D y usar LSTM bidireccional.
+
+        # Como tenemos pocas muestras, es critico evitar el sobreajuste. Para ello, usar Dropout y Batch Normalization. Ademas, usar Early Stopping para detener el entrenamiento si la perdida de validacion no mejora durante un numero determinado de epocas.
         
         # Define LSTM model
         model = Sequential()
-        model.add(LSTM(64, input_shape=(X.shape[1], X.shape[2]), return_sequences=False))
-        model.add(Dropout(0.2))
-        model.add(Dense(1, activation='sigmoid'))
+        # La forma ("shape") de la entrada será (num_descargas, max_signal_length, 7):
+        # - num_descargas: tipicamente 6, aunque decide el orquestador
+        # - max_signal_length: es el tamaño maximo de las señales, debido a que hemos rellenado con ceros las señales mas cortas
+        # - 7: el número de señales (features) que tenemos por descarga
+        
+        # 1. Definicion de la entrada
+        inputs = Input(shape=(None, 7), name="input_layer")
+        x = Masking(mask_value=0.0)(inputs)  # Masking layer to ignore padded values
 
-        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+        # 2. Capas convolucionales 1D
+        cnn = Conv1D(filters=128, kernel_size=3, padding='same', name="conv1d_layer_1")(x)
+        cnn = BatchNormalization(name="bn1")(cnn)
+        cnn = Activation('relu', name="act1")(cnn)
 
-        model.fit(X, y, epochs=200, batch_size=32, verbose=1)
+        cnn = Conv1D(filters=128, kernel_size=3, padding='same', name="conv1d_layer_2")(cnn)
+        cnn = BatchNormalization(name="bn2")(cnn)
+        cnn = Activation('relu', name="act2")(cnn)
 
+        # 3. Resumen de la rama CNN
+        cnn_branch = GlobalMaxPooling1D(name="global_max_pooling")(cnn)
+        
+        # 4. Capa LSTM sobre la salida de la CNN
+        lstm = LSTM(
+            units=64,
+            dropout=0.2,
+            recurrent_dropout=0.2,
+            name="lstm_layer"
+        )(cnn)
+        
+
+        # 5. Concatenar la salida de la LSTM con la salida de la CNN
+        merged = concatenate([cnn_branch, lstm], name="concat")
+
+        # 6. Capa de salida
+        outputs = Dense(1, activation='sigmoid', name="output_layer")(merged)
+
+        # 7. Contruccion y compilacion del modelo
+        model = Model(inputs, outputs, name="CNN_LSTM_Model")
+        
+        model.compile(
+            optimizer=Adam(learning_rate=1e-3), 
+            loss='binary_crossentropy', 
+            metrics=['accuracy']
+        )
+
+        model.summary()
+        
+        # 8. Entrenamiento del modelo
+        X_train, y_train = get_X_y(discharges)
+        
+        # X_train no tiene la forma (num_descargas, max_signal_length, 7), sino que es del tipo (num_descargas, 7, max_signal_length). Transponer.
+        X_train = np.array([np.array(signal).T for signal in X_train])
+        y_train = np.array(y_train)
+        
+        max_length = max(len(seq) for seq in X_train)
+                
+        X_train = pad_sequences(
+            X_train, 
+            maxlen=max_length, 
+            padding='post', 
+            dtype='float32',
+            value=0.0
+        )
+        # print(f"X_train shape: {X_train.shape}")
+        # Callbacks para regularizacion y ajuste de learning rate
+        callbacks = [
+            EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, verbose=1),
+            ModelCheckpoint(MODEL_PATH, monitor='val_loss', save_best_only=True, verbose=1)
+        ]
+        print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
+
+        # Train the model
+        history = model.fit(
+            X_train,
+            y_train,
+            epochs=100,
+            batch_size=2,
+            callbacks=callbacks,
+            shuffle=True,
+        )
+        print(f"Training history: {history.history}")
         # Calculate execution time
         execution_time = (time.time() - start_execution) * 1000  # ms
         
@@ -246,7 +286,7 @@ async def train_model(request: TrainingRequest):
                 error="Training failed",
                 code="TRAINING_ERROR",
                 details={"message": str(e)}
-            ).dict()
+            ).model_dump()
         )
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -262,31 +302,50 @@ async def predict(request: PredictionRequest):
                 error="Model not trained",
                 code="MODEL_NOT_FOUND",
                 details={"message": "Please train the model first"}
-            ).dict()
+            ).model_dump()
         )
     
     try:
-        execution_time = (time.time() - start_execution) * 1000  # ms
+        discharges = []
+        for discharge in request.discharges:
+            signals = []
+            for signal in discharge.signals:
+                signals.append(
+                    InternalSignal(
+                        label=signal.fileName,
+                        times=signal.times if signal.times else discharge.times,
+                        values=signal.values,
+                        signal_type=get_signal_type(get_sensor_id(signal.fileName)),
+                    ))
         
-        X, _ = sliding_normalized_windows(request.discharges, window_size=500, overlap=0.5)
-        logger.info(f"Prediction data shape: {X.shape}")
-    
-        predictions = []
-        for i in range(X.shape[0]):
-            prediction = model.predict(X[i:i+1])
-            predictions.append(prediction[0][0])
+            discharges.append(
+                InternalDischarge(
+                    signals=signals, 
+                )
+            )
 
-        prediction = 1 if np.mean(predictions) > 0.5 else 0
-        confidence = np.mean(predictions) if prediction == 1 else 1 - np.mean(predictions)
+        X_pred, _ = get_X_y(discharges)
+        max_length = max(len(seq) for seq in X_pred)
+        X_pred = pad_sequences(
+            X_pred, maxlen=max_length, padding='post', dtype='float32', value=0.0
+        )
+        # Make predictions
+        predictions = model.predict(X_pred, batch_size=2)
+        predictions = np.where(predictions > 0.5, 1, 0).flatten()
+        print(f"Predictions: {predictions}")
 
+        confidence = np.mean(predictions)
+        print(f"Confidence: {confidence}")
+        
+        execution_time = (time.time() - start_execution) * 1000  # ms
         return PredictionResponse(
-            prediction=prediction,
+            prediction=int(predictions[0]),
             confidence=float(confidence),
             executionTimeMs=execution_time,
             model="lstm",
             details={
-                "individualPredictions": [],
-                "individualConfidences": 0.4,
+                "individualPredictions": predictions.tolist(),
+                "individualConfidences": confidence.tolist(),
                 "numDischargesProcessed": len(request.discharges),
                 "featureImportance": 0
             }
@@ -300,7 +359,7 @@ async def predict(request: PredictionRequest):
                 error="Prediction failed",
                 code="PREDICTION_ERROR",
                 details={"message": str(e)}
-            ).dict()
+            ).model_dump()
         )
 
 @app.get("/health", response_model=HealthCheckResponse)
