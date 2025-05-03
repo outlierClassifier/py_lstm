@@ -17,6 +17,7 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.regularizers import l2
+from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import uvicorn
 import numpy as np
@@ -239,7 +240,11 @@ async def train_model(request: TrainingRequest):
         X_train = np.array([np.array(signal).T for signal in X_train])
         y_train = np.array(y_train)
         
-        # print(f"X_train shape: {X_train.shape}")
+        # Barajar los datos
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train, y_train, test_size=0.2, 
+            shuffle=True, stratify=y_train
+        )
 
         # Callbacks para regularizacion y ajuste de learning rate
         callbacks = [
@@ -251,11 +256,11 @@ async def train_model(request: TrainingRequest):
 
         # Train the model
         history = model.fit(
-            X_train,
-            y_train,
+            X_tr,
+            y_tr,
             epochs=100,
             batch_size=2,
-            validation_split=0.2,
+            validation_data=(X_val, y_val),
             callbacks=callbacks,
             shuffle=True,
         )
