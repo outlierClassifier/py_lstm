@@ -1,5 +1,6 @@
 import dis
 from gc import callbacks
+from pydoc import cli
 from random import shuffle
 import re
 from tabnanny import verbose
@@ -16,7 +17,7 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.regularizers import l2
-import test
+import matplotlib.pyplot as plt
 import uvicorn
 import numpy as np
 from typing import List, Dict, Any, Optional
@@ -224,9 +225,9 @@ async def train_model(request: TrainingRequest):
         model = Model(inputs, outputs, name="CNN_LSTM_Model")
         
         model.compile(
-            optimizer=Adam(learning_rate=0.01), 
+            optimizer=Adam(learning_rate=0.001, clipnorm=1.0), 
             loss='binary_crossentropy', 
-            metrics=['accuracy']
+            metrics=['accuracy'],
         )
 
         model.summary()
@@ -254,10 +255,20 @@ async def train_model(request: TrainingRequest):
             y_train,
             epochs=100,
             batch_size=2,
+            validation_split=0.2,
             callbacks=callbacks,
             shuffle=True,
         )
         print(f"Training history: {history.history}")
+        plt.figure()
+        plt.plot(history.history['loss'], label='train_loss')
+        plt.plot(history.history['val_loss'], label='val_loss')
+        plt.legend(); plt.show()
+
+        plt.figure()
+        plt.plot(history.history['accuracy'], label='train_acc')
+        plt.plot(history.history['val_accuracy'], label='val_acc')
+        plt.legend(); plt.show()
         # Calculate execution time
         execution_time = (time.time() - start_execution) * 1000  # ms
         
