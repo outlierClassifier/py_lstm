@@ -361,6 +361,16 @@ async def predict(request: PredictionRequest):
                 )
             )
 
+        # Generate windowed data
+        windowed_discharges = []
+        for discharge in discharges:
+            windowed_discharges.extend(
+                discharge.generate_windows(
+                    window_size=500, step = 1, overlap=0.5
+                )
+            )
+        discharges = windowed_discharges
+
         X_pred, _ = get_X_y(discharges)
         X_pred = np.array([np.array(signal).T for signal in X_pred])
 
