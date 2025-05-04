@@ -6,12 +6,12 @@ import re
 from tabnanny import verbose
 from turtle import mode
 from fastapi import FastAPI, HTTPException, Request
-from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.layers import (
     Dense, LSTM, Dropout, Masking, GlobalMaxPooling1D, Flatten, 
-    BatchNormalization, Input, Conv1D, Activation, concatenate
+    BatchNormalization, Input, Conv1D, Activation, concatenate,
+    MaxPooling1D, SpatialDropout1D
     )
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
@@ -170,6 +170,20 @@ async def train_model(request: TrainingRequest):
             discharges.extend(extended)
             i += 1
 
+    # Generate windowed data
+    windowed_discharges = []
+    for discharge in discharges:
+        windowed_discharges.extend(
+            discharge.generate_windows(
+                window_size=500, step = 1, overlap=0.5
+            )
+        )
+    
+    discharges = windowed_discharges
+    print(f"Number of discharges after augmentation: {len(discharges)}")
+    for discharge in discharges:
+        print(f"Discharge shape: {discharge.shape()}, disruption_class: {discharge.disruption_class}")
+
     # Fill with zeros to make all discharges the same length
     # discharges = pad(discharges)
 
@@ -199,10 +213,14 @@ async def train_model(request: TrainingRequest):
         cnn = Conv1D(filters=128, kernel_size=3, padding='same', name="conv1d_layer_1")(inputs)
         cnn = BatchNormalization(name="bn1")(cnn)
         cnn = Activation('relu', name="act1")(cnn)
+        cnn = SpatialDropout1D(0.3, name="spatial_dropout1")(cnn)
+        cnn = MaxPooling1D(pool_size=2, name="maxpool1")(cnn) # MaxPooling para reducir la dimensionalidad y evitar el sobreajuste
 
-        # cnn = Conv1D(filters=128, kernel_size=3, padding='same', name="conv1d_layer_2")(cnn)
-        # cnn = BatchNormalization(name="bn2")(cnn)
-        # cnn = Activation('relu', name="act2")(cnn)
+        cnn = Conv1D(filters=128, kernel_size=3, padding='same', name="conv1d_layer_2")(cnn)
+        cnn = BatchNormalization(name="bn2")(cnn)
+        cnn = Activation('relu', name="act2")(cnn)
+        cnn = SpatialDropout1D(0.3, name="spatial_dropout2")(cnn)
+        cnn = MaxPooling1D(pool_size=2, name="maxpool2")(cnn)
 
         # 3. Resumen de la rama CNN
         cnn_branch = GlobalMaxPooling1D(name="global_max_pooling")(cnn)
@@ -406,37 +424,6 @@ async def increase_json_size_limit(request: Request, call_next):
     return response
 
 if __name__ == "__main__":
-    # discharge1 = Discharge(
-    #     id="DES_1",
-    #     signals=[
-    #         Signal(fileName="DES_1_1", values=[1, 2, 3], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_2", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_3", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_4", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_5", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_6", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_7", values=[7, 8, 9], times=[1, 2, 3]),
-    #     ],
-    #     anomalyTime=1.5
-    # )
-    # discharge2 = Discharge(
-    #     id="DES_2",
-    #     signals=[
-    #         Signal(fileName="DES_2_1", values=[3, 4, 5], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_2", values=[3, 2, 1], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_3", values=[4, 5, 6], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_4", values=[7, 8, 9], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_5", values=[7, 8, 9], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_6", values=[7, 8, 9], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_7", values=[7, 8, 9], times=[1, 2, 3]),
-    #     ],
-    #     anomalyTime=None
-    # )
-    # discharges = [discharge1, discharge2]
-    # X,y = sliding_window(discharges, window_size=2, overlap=0.5)
-
-    # print(f"X: {X}, y: {y}")
-
     # Try to load the model
     if os.path.exists(MODEL_PATH):
         try:
