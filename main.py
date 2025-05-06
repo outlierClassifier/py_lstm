@@ -1,8 +1,21 @@
 import re
 from fastapi import FastAPI, HTTPException, Request
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM, Dropout
+import tensorflow as tf
+from tensorflow.keras import Model, Input
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import (
+    Dense, LSTM, Dropout, Masking, GlobalMaxPooling1D, Flatten, 
+    BatchNormalization, Input, Conv1D, Activation, concatenate,
+    MaxPooling1D, SpatialDropout1D, Attention, Bidirectional
+    )
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.regularizers import l2
+from sklearn.model_selection import train_test_split, GroupKFold, GroupShuffleSplit
+from sklearn.utils import class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
 import uvicorn
 import numpy as np
 from typing import List, Dict, Any, Optional
@@ -13,8 +26,11 @@ import os
 import pickle
 import psutil
 import logging
+from signals import Signal as InternalSignal, Discharge as InternalDischarge, DisruptionClass, get_X_y, get_signal_type, generate_more_discharges, pad
 
 PATTERN = "DES_(\\d+)_(\\d+)"
+WINDOW_SIZE = 500
+OVERLAP = 0.2
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -90,7 +106,7 @@ app = FastAPI(
 )
 
 # Global variables
-MODEL_PATH = "lstm_model.h5"
+MODEL_PATH = "lstm_model.keras"
 start_time = time.time()
 last_training_time = None
 model = None
@@ -112,65 +128,13 @@ def get_sensor_id(signal: Signal) -> str:
     else:
         raise ValueError(f"Invalid signal file name format: {signal.fileName}")
 
-def sliding_normalized_windows(discharges: list[Discharge], window_size: int, overlap: float):
-    """
-    ## Sliding window function
-    This function takes a list of Discharge objects, normalizes the signals of the same type
-    among all discharges, and creates sliding windows of a specified size with a given overlap.
-
-    :param discharges: List of Discharge objects
-    :param window_size: Size of the sliding window
-    :param overlap: Overlap between windows (0.0 to 1.0)
-    :return: Tuple of numpy arrays (X, y) where X is the input data and y is the labels
-    """
-    step = int(window_size * (1 - overlap))
-
-    sensor_ids = [get_sensor_id(s) for s in discharges[0].signals]
-
-    scalers = {}
-    for sid in sensor_ids:
-        all_values = np.concatenate([
-            np.asarray(
-                [s.values for s in d.signals if get_sensor_id(s) == sid],
-                dtype=np.float32
-            ).ravel()
-            for d in discharges
-        ]).reshape(-1, 1)
-
-        scaler = MinMaxScaler()
-        scaler.fit(all_values)
-        scalers[sid] = scaler
-
-    norm_discharge = []
-    for d in discharges:
-        norm_signals = []
-        for s in d.signals:
-            arr = np.asarray(s.values).reshape(-1, 1)
-            arr_norm = scalers[get_sensor_id(s)].transform(arr).ravel()
-            norm_signals.append({
-                'id': get_sensor_id(s),
-                'values': arr_norm,
-            })
-        norm_discharge.append({
-            'signals': norm_signals,
-            'label': 1 if d.anomalyTime else 0,
-        })
-    
-    X, y = [], []
-    for d in norm_discharge:
-        signals = d['signals']
-        label = d['label']
-        lenght = len(signals[0]['values'])
-        assert all(len(s['values']) == lenght for s in signals), "All signals must have the same length"
-
-        for i in range(0, lenght - window_size + 1, step):
-            window = [s['values'][i:i + window_size] for s in signals]
-            X.append(window)
-            y.append(label)
-
-    X = np.array(X)
-    X = np.transpose(X, (0, 2, 1))  # Change shape to (samples, time steps, features)
-    return X, np.array(y)
+def focal_loss(gamma=2.0, alpha=0.25):
+    def f1(y_true, y_pred):
+        bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        alpha_t = y_true * alpha + (1 - y_true) * (1 - alpha)
+        return alpha_t * tf.pow((1 - p_t), gamma) * bce
+    return f1
 
 def is_anomaly(discharge: Discharge) -> bool:
     """Determine if a discharge has an anomaly based on anomalyTime"""
@@ -178,76 +142,123 @@ def is_anomaly(discharge: Discharge) -> bool:
 
 @app.post("/train", response_model=TrainingResponse)
 async def train_model(request: TrainingRequest):
-    global model, last_training_time
-    
-    start_execution = time.time()
-    
-    # Idea general
-    # 1. Escalar las 7 features de cada discharge (normalizar) con MinMaxScaler
-    # 2. Crear ventanas deslizantes de 500 muestras
-    # 3. Crear un array de numpy con las ventanas y otro con los labels (1 si es anomalia, 0 si no).
-    #    Todas las ventanas de la misma descarga tienen el mismo label.
-    # 4. Los datos que tendremos son:
-    #    - 7 features (las 7 señales) por ventana
-    #    - Unas 10k / tamano de ventana (500) = 20 ventanas por descarga
-    #    - 6 descargas por entrenamiento: 120 ventanas
-    # 5. Arquitectura LSTM:
-    #    - Tenemos pocas ventanas -> Probablemente una capa
-    #    - Units: 32 o 64 (no muchas)
-    #    - Dropout: 0.2 o 0.3 (no muchas ventanas)
-    #    - Dense: 1 (sigmoid) -> 0 o 1 (anomalía o no)
-    #    - Optimizer: Adam (learning rate 0.001)
-    #    - Epochs: 200
-    #    - Batch size: 32 - 64
-    #    - Loss: binary_crossentropy
+    global MODEL_PATH
+    start_time = time.time()
 
-    try:
-        X, y = sliding_normalized_windows(request.discharges, window_size=500, overlap=0.5)
-        logger.info(f"Training data shape: {X.shape}, Labels: {np.sum(y)} anomalies out of {len(y)}")
-        
-        # Define LSTM model
-        model = Sequential()
-        model.add(LSTM(64, input_shape=(X.shape[1], X.shape[2]), return_sequences=False))
-        model.add(Dropout(0.2))
-        model.add(Dense(1, activation='sigmoid'))
+    # 1) Parse discharges into InternalDischarge
+    internal = []
+    for d in request.discharges:
+        signals = [InternalSignal(
+            label=s.fileName,
+            times=s.times or d.times,
+            values=s.values,
+            signal_type=get_signal_type(get_sensor_id(s)),
+            disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)
+        ) for s in d.signals]
+        internal.append(InternalDischarge(
+            signals=signals,
+            disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)
+        ))
 
-        model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    # 2) Optional minimal augmentation
+    if len(internal) < 10:
+        augmented = []
+        for disc in internal:
+            augmented.extend(disc.generate_similar_discharges(1))
+        internal += augmented
 
-        model.fit(X, y, epochs=200, batch_size=32, verbose=1)
+    # 3) Windowing + strategic sampling
+    WINDOW_SIZE = 500
+    OVERLAP = 0.3
+    SAMPLE_PER_DISCHARGE = 80  # incrementar ventanas totales
+    windowed, groups = [], []
 
-        # Calculate execution time
-        execution_time = (time.time() - start_execution) * 1000  # ms
-        
-        # Generate training ID
-        training_id = f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    for disc_id, disc in enumerate(internal):
+        wins = disc.generate_windows(window_size=WINDOW_SIZE, step=1, overlap=OVERLAP)
+        total_wins = len(wins)
 
-        # Save the model
-        with open(MODEL_PATH, "wb") as f:
-            pickle.dump(model, f)
-        logger.info(f"Model saved to {MODEL_PATH}")
-        
-        return TrainingResponse(
-            status="success",
-            message="Training completed successfully",
-            trainingId=training_id,
-            metrics=TrainingMetrics(
-                accuracy=0.85,  # Placeholder for actual accuracy
-                f1Score=0.8,    # Placeholder for actual F1 score
-                loss=0.1,       # Placeholder for actual loss
-            ),
-            executionTimeMs=execution_time
+        # Si es anomalía, centramos alrededor del punto de disrupción
+        if disc.disruption_class == DisruptionClass.Anomaly and total_wins > SAMPLE_PER_DISCHARGE:
+            # Tomar mitad de ventanas alrededor de la anomalía
+            center = total_wins // 2
+            half = SAMPLE_PER_DISCHARGE // 2
+            start = max(0, center - half)
+            end = min(total_wins, center + half)
+            idxs = np.arange(start, end)
+            # Si no hay suficientes en el rango, rellenar uniformemente
+            if len(idxs) < SAMPLE_PER_DISCHARGE:
+                extra = np.setdiff1d(np.arange(total_wins), idxs)
+                pick = np.random.choice(extra, SAMPLE_PER_DISCHARGE - len(idxs), replace=False)
+                idxs = np.concatenate([idxs, pick])
+        elif total_wins > SAMPLE_PER_DISCHARGE:
+            # No-disruptiva o pocas ventanas: muestreo uniforme
+            idxs = np.linspace(0, total_wins - 1, SAMPLE_PER_DISCHARGE, dtype=int)
+        else:
+            idxs = np.arange(total_wins)
+
+        sampled_wins = [wins[i] for i in idxs]
+        windowed.extend(sampled_wins)
+        groups.extend([disc_id] * len(sampled_wins))
+
+    # 4) Build input arrays
+    X_list, y_list = get_X_y(windowed)
+    X = np.stack([np.array(sig).T for sig in X_list])  # shape (n_windows, time, sensors)
+    y = np.array(y_list)
+    groups = np.array(groups)
+
+    # 5) Model factory
+    def build_model():
+        inp = Input(shape=(WINDOW_SIZE, X.shape[-1]))
+        x = Masking(mask_value=0.0)(inp)
+        x = Bidirectional(LSTM(32, return_sequences=False))(x)
+        x = Dropout(0.2)(x)
+        x = Dense(16, activation="relu")(x)
+        x = Dropout(0.2)(x)
+        out = Dense(1, activation="sigmoid")(x)
+        m = Model(inp, out)
+        m.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+        return m
+
+    # 6) Leave-One-Discharge-Out CV
+    cv = GroupShuffleSplit(n_splits=8, test_size=0.25, random_state=42)
+    for fold, (tr_idx, val_idx) in enumerate(cv.split(X, y, groups), start=1):
+        print(f"--- Fold {fold}/8 ---")
+        X_tr, y_tr = X[tr_idx], y[tr_idx]
+        X_val, y_val = X[val_idx], y[val_idx]
+
+        model = build_model()
+        callbacks = [
+            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+        ]
+
+        model.fit(
+            X_tr, y_tr,
+            validation_data=(X_val, y_val),
+            epochs=50,
+            batch_size=8,
+            callbacks=callbacks,
+            shuffle=True
         )
-        
-    except Exception as e:
-        logger.error(f"Training error: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail=ErrorResponse(
-                error="Training failed",
-                code="TRAINING_ERROR",
-                details={"message": str(e)}
-            ).dict()
-        )
+
+        probs = model.predict(X_val).ravel()
+        threshold = 0.5
+        preds = (probs > threshold).astype(int)
+        report = classification_report(y_val, preds, labels=[0,1], target_names=["Normal","Anomaly"], zero_division=0)
+        print(f"Fold {fold} report:\n{report}")
+
+    # 7) Save final model
+    model.save(MODEL_PATH)
+    exec_ms = int((time.time() - start_time) * 1000)
+    training_id = f"train_{datetime.datetime.now():%Y%m%d_%H%M%S}"
+    return TrainingResponse(
+        status="success",
+        message="Training completed with anomaly-centered sampling",
+        trainingId=training_id,
+        metrics=TrainingMetrics(accuracy=None, loss=None, f1Score=None),
+        executionTimeMs=exec_ms
+    )
+
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
@@ -262,31 +273,58 @@ async def predict(request: PredictionRequest):
                 error="Model not trained",
                 code="MODEL_NOT_FOUND",
                 details={"message": "Please train the model first"}
-            ).dict()
+            ).model_dump()
         )
     
     try:
-        execution_time = (time.time() - start_execution) * 1000  # ms
+        discharges = []
+        for discharge in request.discharges:
+            signals = []
+            for signal in discharge.signals:
+                signals.append(
+                    InternalSignal(
+                        label=signal.fileName,
+                        times=signal.times if signal.times else discharge.times,
+                        values=signal.values,
+                        signal_type=get_signal_type(get_sensor_id(signal)),
+                    ))
         
-        X, _ = sliding_normalized_windows(request.discharges, window_size=500, overlap=0.5)
-        logger.info(f"Prediction data shape: {X.shape}")
-    
-        predictions = []
-        for i in range(X.shape[0]):
-            prediction = model.predict(X[i:i+1])
-            predictions.append(prediction[0][0])
+            discharges.append(
+                InternalDischarge(
+                    signals=signals, 
+                )
+            )
 
-        prediction = 1 if np.mean(predictions) > 0.5 else 0
-        confidence = np.mean(predictions) if prediction == 1 else 1 - np.mean(predictions)
+        # Generate windowed data
+        windowed_discharges = []
+        for discharge in discharges:
+            windowed_discharges.extend(
+                discharge.generate_windows(
+                    window_size=WINDOW_SIZE, step=1, overlap=OVERLAP
+                )
+            )
+        discharges = windowed_discharges
 
+        X_pred, _ = get_X_y(discharges)
+        X_pred = np.array([np.array(signal).T for signal in X_pred])
+
+        # Make predictions
+        predictions = model.predict(X_pred, batch_size=2)
+        probs = np.where(predictions > 0.5, 1, 0).flatten()
+        print(f"Predictions: {predictions}")
+
+        confidence = np.mean(predictions)
+        print(f"Confidence: {confidence}")
+        
+        execution_time = (time.time() - start_execution) * 1000  # ms
         return PredictionResponse(
-            prediction=prediction,
+            prediction=int(predictions[0]),
             confidence=float(confidence),
             executionTimeMs=execution_time,
             model="lstm",
             details={
-                "individualPredictions": [],
-                "individualConfidences": 0.4,
+                "individualPredictions": predictions.tolist(),
+                "individualConfidences": confidence.tolist(),
                 "numDischargesProcessed": len(request.discharges),
                 "featureImportance": 0
             }
@@ -300,7 +338,7 @@ async def predict(request: PredictionRequest):
                 error="Prediction failed",
                 code="PREDICTION_ERROR",
                 details={"message": str(e)}
-            ).dict()
+            ).model_dump()
         )
 
 @app.get("/health", response_model=HealthCheckResponse)
@@ -330,37 +368,6 @@ async def increase_json_size_limit(request: Request, call_next):
     return response
 
 if __name__ == "__main__":
-    # discharge1 = Discharge(
-    #     id="DES_1",
-    #     signals=[
-    #         Signal(fileName="DES_1_1", values=[1, 2, 3], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_2", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_3", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_4", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_5", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_6", values=[6, 5, 4], times=[1, 2, 3]),
-    #         Signal(fileName="DES_1_7", values=[7, 8, 9], times=[1, 2, 3]),
-    #     ],
-    #     anomalyTime=1.5
-    # )
-    # discharge2 = Discharge(
-    #     id="DES_2",
-    #     signals=[
-    #         Signal(fileName="DES_2_1", values=[3, 4, 5], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_2", values=[3, 2, 1], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_3", values=[4, 5, 6], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_4", values=[7, 8, 9], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_5", values=[7, 8, 9], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_6", values=[7, 8, 9], times=[1, 2, 3]),
-    #         Signal(fileName="DES_2_7", values=[7, 8, 9], times=[1, 2, 3]),
-    #     ],
-    #     anomalyTime=None
-    # )
-    # discharges = [discharge1, discharge2]
-    # X,y = sliding_window(discharges, window_size=2, overlap=0.5)
-
-    # print(f"X: {X}, y: {y}")
-
     # Try to load the model
     if os.path.exists(MODEL_PATH):
         try:
@@ -370,7 +377,7 @@ if __name__ == "__main__":
             logger.error(f"Error loading model: {str(e)}")
             model = None
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=True, 
+    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=False, 
                 limit_concurrency=50, 
                 limit_max_requests=20000,
                 timeout_keep_alive=120)
