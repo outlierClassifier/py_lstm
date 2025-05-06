@@ -1,23 +1,20 @@
-import dis
-from gc import callbacks
-from pydoc import cli
-from random import shuffle
 import re
-from tabnanny import verbose
-from turtle import mode
 from fastapi import FastAPI, HTTPException, Request
 import tensorflow as tf
+from tensorflow.keras import Model, Input
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras.layers import (
     Dense, LSTM, Dropout, Masking, GlobalMaxPooling1D, Flatten, 
     BatchNormalization, Input, Conv1D, Activation, concatenate,
-    MaxPooling1D, SpatialDropout1D
+    MaxPooling1D, SpatialDropout1D, Attention, Bidirectional
     )
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.regularizers import l2
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupKFold, GroupShuffleSplit
+from sklearn.utils import class_weight
+from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import uvicorn
 import numpy as np
@@ -29,9 +26,11 @@ import os
 import pickle
 import psutil
 import logging
-from signals import Signal as InternalSignal, Discharge as InternalDischarge, DisruptionClass, get_X_y, get_signal_type, pad
+from signals import Signal as InternalSignal, Discharge as InternalDischarge, DisruptionClass, get_X_y, get_signal_type, generate_more_discharges, pad
 
 PATTERN = "DES_(\\d+)_(\\d+)"
+WINDOW_SIZE = 500
+OVERLAP = 0.2
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -107,7 +106,7 @@ app = FastAPI(
 )
 
 # Global variables
-MODEL_PATH = "lstm_model.h5"
+MODEL_PATH = "lstm_model.keras"
 start_time = time.time()
 last_training_time = None
 model = None
@@ -129,6 +128,13 @@ def get_sensor_id(signal: Signal) -> str:
     else:
         raise ValueError(f"Invalid signal file name format: {signal.fileName}")
 
+def focal_loss(gamma=2.0, alpha=0.25):
+    def f1(y_true, y_pred):
+        bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        alpha_t = y_true * alpha + (1 - y_true) * (1 - alpha)
+        return alpha_t * tf.pow((1 - p_t), gamma) * bce
+    return f1
 
 def is_anomaly(discharge: Discharge) -> bool:
     """Determine if a discharge has an anomaly based on anomalyTime"""
@@ -136,195 +142,123 @@ def is_anomaly(discharge: Discharge) -> bool:
 
 @app.post("/train", response_model=TrainingResponse)
 async def train_model(request: TrainingRequest):
-    global model, last_training_time
-    
-    start_execution = time.time()
-    
-    discharges = []
-    for discharge in request.discharges:
-        signals = []
-        for signal in discharge.signals:
-            signals.append(
-                InternalSignal(
-                    label=signal.fileName,
-                    times=signal.times if signal.times else discharge.times,
-                    values=signal.values,
-                    signal_type=get_signal_type(get_sensor_id(signal)),
-                    disruption_class=DisruptionClass.Anomaly if discharge.anomalyTime else DisruptionClass.Normal
-                ))
-    
-        discharges.append(
-            InternalDischarge(
-                signals=signals, 
-                disruption_class=DisruptionClass.Anomaly if discharge.anomalyTime else DisruptionClass.Normal
-            )
-        )
+    global MODEL_PATH
+    start_time = time.time()
 
-    # Data augmentation
-    if len(discharges) < 10:
-        n_discharges = len(discharges) 
-        i = 0
-        while i < n_discharges:
-            d = discharges[i]
-            extended = d.generate_similar_discharges(5)
-            discharges.extend(extended)
-            i += 1
+    # 1) Parse discharges into InternalDischarge
+    internal = []
+    for d in request.discharges:
+        signals = [InternalSignal(
+            label=s.fileName,
+            times=s.times or d.times,
+            values=s.values,
+            signal_type=get_signal_type(get_sensor_id(s)),
+            disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)
+        ) for s in d.signals]
+        internal.append(InternalDischarge(
+            signals=signals,
+            disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)
+        ))
 
-    # Generate windowed data
-    windowed_discharges = []
-    for discharge in discharges:
-        windowed_discharges.extend(
-            discharge.generate_windows(
-                window_size=500, step = 1, overlap=0.5
-            )
-        )
-    
-    discharges = windowed_discharges
-    print(f"Number of discharges after augmentation: {len(discharges)}")
-    for discharge in discharges:
-        print(f"Discharge shape: {discharge.shape()}, disruption_class: {discharge.disruption_class}")
+    # 2) Optional minimal augmentation
+    if len(internal) < 10:
+        augmented = []
+        for disc in internal:
+            augmented.extend(disc.generate_similar_discharges(1))
+        internal += augmented
 
-    # Fill with zeros to make all discharges the same length
-    # discharges = pad(discharges)
+    # 3) Windowing + strategic sampling
+    WINDOW_SIZE = 500
+    OVERLAP = 0.3
+    SAMPLE_PER_DISCHARGE = 80  # incrementar ventanas totales
+    windowed, groups = [], []
 
-    try:
-        # Configuración: Combinacion de capas CNN 1D para extraer patrones locales y LSTM para capturar dependencias temporales largas
-        # 1. 2 bloques consecurivos de capas convolucionales 1D con filtros pequeños (128 a 256 filtros de tamaño 3 a 5), cada uno seguido de una capa de Batch Normalization y una capa de activación ReLU. Estas capas aprenden a filtrar ruido y extraer caracteristicas discriminativas a corto plazo.
-        # 2. Una capa LSTM con 64 a 128 unidades, aplicadas sobre las caracteristicas extraidas por las capas convolucionales. Usar `recurrent_dropout` y `dropout` para regularizar. El LSTM aprende patrones temporales a largo plazo.
-        # 3. Concatenacion de las salidas de la capa LSTM con las salidas de las capas convolucionales. Esto permite al modelo aprender tanto patrones locales como temporales.
-        # 4. Capa de salida: una capa densa con activacion sigmoide para clasificar la salida como normal o anomalia. Como funcion de perdida, usar `binary_crossentropy` y como optimizador `adam` con un learning rate de 0.001.
+    for disc_id, disc in enumerate(internal):
+        wins = disc.generate_windows(window_size=WINDOW_SIZE, step=1, overlap=OVERLAP)
+        total_wins = len(wins)
 
-        # El esquema general es: Input (tiempo x 7 señales) -> CNN1D x2 -> LSTM -> Concatenacion -> Dense (1,sigmoide)
-        # Otras opciones son: Usar 3 capas convolucionales 1D y usar LSTM bidireccional.
+        # Si es anomalía, centramos alrededor del punto de disrupción
+        if disc.disruption_class == DisruptionClass.Anomaly and total_wins > SAMPLE_PER_DISCHARGE:
+            # Tomar mitad de ventanas alrededor de la anomalía
+            center = total_wins // 2
+            half = SAMPLE_PER_DISCHARGE // 2
+            start = max(0, center - half)
+            end = min(total_wins, center + half)
+            idxs = np.arange(start, end)
+            # Si no hay suficientes en el rango, rellenar uniformemente
+            if len(idxs) < SAMPLE_PER_DISCHARGE:
+                extra = np.setdiff1d(np.arange(total_wins), idxs)
+                pick = np.random.choice(extra, SAMPLE_PER_DISCHARGE - len(idxs), replace=False)
+                idxs = np.concatenate([idxs, pick])
+        elif total_wins > SAMPLE_PER_DISCHARGE:
+            # No-disruptiva o pocas ventanas: muestreo uniforme
+            idxs = np.linspace(0, total_wins - 1, SAMPLE_PER_DISCHARGE, dtype=int)
+        else:
+            idxs = np.arange(total_wins)
 
-        # Como tenemos pocas muestras, es critico evitar el sobreajuste. Para ello, usar Dropout y Batch Normalization. Ademas, usar Early Stopping para detener el entrenamiento si la perdida de validacion no mejora durante un numero determinado de epocas.
-        
-        # Define LSTM model
-        model = Sequential()
-        # La forma ("shape") de la entrada será (num_descargas, max_signal_length, 7):
-        # - num_descargas: tipicamente 6, aunque decide el orquestador
-        # - max_signal_length: es el tamaño maximo de las señales, debido a que hemos rellenado con ceros las señales mas cortas
-        # - 7: el número de señales (features) que tenemos por descarga
-        
-        # 1. Definicion de la entrada
-        inputs = Input(shape=(None, 7), name="input_layer")
+        sampled_wins = [wins[i] for i in idxs]
+        windowed.extend(sampled_wins)
+        groups.extend([disc_id] * len(sampled_wins))
 
-        # 2. Capas convolucionales 1D
-        cnn = Conv1D(filters=128, kernel_size=3, padding='same', name="conv1d_layer_1")(inputs)
-        cnn = BatchNormalization(name="bn1")(cnn)
-        cnn = Activation('relu', name="act1")(cnn)
-        cnn = SpatialDropout1D(0.3, name="spatial_dropout1")(cnn)
-        cnn = MaxPooling1D(pool_size=2, name="maxpool1")(cnn) # MaxPooling para reducir la dimensionalidad y evitar el sobreajuste
+    # 4) Build input arrays
+    X_list, y_list = get_X_y(windowed)
+    X = np.stack([np.array(sig).T for sig in X_list])  # shape (n_windows, time, sensors)
+    y = np.array(y_list)
+    groups = np.array(groups)
 
-        cnn = Conv1D(filters=128, kernel_size=3, padding='same', name="conv1d_layer_2")(cnn)
-        cnn = BatchNormalization(name="bn2")(cnn)
-        cnn = Activation('relu', name="act2")(cnn)
-        cnn = SpatialDropout1D(0.3, name="spatial_dropout2")(cnn)
-        cnn = MaxPooling1D(pool_size=2, name="maxpool2")(cnn)
+    # 5) Model factory
+    def build_model():
+        inp = Input(shape=(WINDOW_SIZE, X.shape[-1]))
+        x = Masking(mask_value=0.0)(inp)
+        x = Bidirectional(LSTM(32, return_sequences=False))(x)
+        x = Dropout(0.2)(x)
+        x = Dense(16, activation="relu")(x)
+        x = Dropout(0.2)(x)
+        out = Dense(1, activation="sigmoid")(x)
+        m = Model(inp, out)
+        m.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+        return m
 
-        # 3. Resumen de la rama CNN
-        cnn_branch = GlobalMaxPooling1D(name="global_max_pooling")(cnn)
-        
-        # 4. Capa LSTM sobre la salida de la CNN
-        lstm = LSTM(
-            units=32,
-            dropout=0.2,
-            recurrent_dropout=0.2,
-            kernel_regularizer=l2(1e-4),
-            name="lstm_layer"
-        )(cnn)
+    # 6) Leave-One-Discharge-Out CV
+    cv = GroupShuffleSplit(n_splits=8, test_size=0.25, random_state=42)
+    for fold, (tr_idx, val_idx) in enumerate(cv.split(X, y, groups), start=1):
+        print(f"--- Fold {fold}/8 ---")
+        X_tr, y_tr = X[tr_idx], y[tr_idx]
+        X_val, y_val = X[val_idx], y[val_idx]
 
-        # 5. Concatenar la salida de la LSTM con la salida de la CNN
-        merged = concatenate([cnn_branch, lstm], name="concat")
-
-        # 6. Capa de salida
-        outputs = Dense(1, activation='sigmoid', name="output_layer")(merged)
-
-        # 7. Contruccion y compilacion del modelo
-        model = Model(inputs, outputs, name="CNN_LSTM_Model")
-        
-        model.compile(
-            optimizer=Adam(learning_rate=0.001, clipnorm=1.0), 
-            loss='binary_crossentropy', 
-            metrics=['accuracy'],
-        )
-
-        model.summary()
-        
-        # 8. Entrenamiento del modelo
-        X_train, y_train = get_X_y(discharges)
-        
-        # X_train no tiene la forma (num_descargas, max_signal_length, 7), sino que es del tipo (num_descargas, 7, max_signal_length). Transponer.
-        X_train = np.array([np.array(signal).T for signal in X_train])
-        y_train = np.array(y_train)
-        
-        # Barajar los datos
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_train, y_train, test_size=0.2, 
-            shuffle=True, stratify=y_train
-        )
-
-        # Callbacks para regularizacion y ajuste de learning rate
+        model = build_model()
         callbacks = [
-            EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, verbose=1),
-            ModelCheckpoint(MODEL_PATH, monitor='val_loss', save_best_only=True, verbose=1)
+            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
         ]
-        print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
 
-        # Train the model
-        history = model.fit(
-            X_tr,
-            y_tr,
-            epochs=100,
-            batch_size=2,
+        model.fit(
+            X_tr, y_tr,
             validation_data=(X_val, y_val),
+            epochs=50,
+            batch_size=8,
             callbacks=callbacks,
-            shuffle=True,
+            shuffle=True
         )
-        print(f"Training history: {history.history}")
-        plt.figure()
-        plt.plot(history.history['loss'], label='train_loss')
-        plt.plot(history.history['val_loss'], label='val_loss')
-        plt.legend(); plt.show()
 
-        plt.figure()
-        plt.plot(history.history['accuracy'], label='train_acc')
-        plt.plot(history.history['val_accuracy'], label='val_acc')
-        plt.legend(); plt.show()
-        # Calculate execution time
-        execution_time = (time.time() - start_execution) * 1000  # ms
-        
-        # Generate training ID
-        training_id = f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        probs = model.predict(X_val).ravel()
+        threshold = 0.5
+        preds = (probs > threshold).astype(int)
+        report = classification_report(y_val, preds, labels=[0,1], target_names=["Normal","Anomaly"], zero_division=0)
+        print(f"Fold {fold} report:\n{report}")
 
-        # Save the model
-        with open("lstm_backup.keras", "wb") as f:
-            pickle.dump(model, f)
-        logger.info(f"Model saved to lstm_backup.keras")
-        
-        return TrainingResponse(
-            status="success",
-            message="Training completed successfully",
-            trainingId=training_id,
-            metrics=TrainingMetrics(
-                accuracy=0.85,  # Placeholder for actual accuracy
-                f1Score=0.8,    # Placeholder for actual F1 score
-                loss=0.1,       # Placeholder for actual loss
-            ),
-            executionTimeMs=execution_time
-        )
-        
-    except Exception as e:
-        logger.error(f"Training error: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail=ErrorResponse(
-                error="Training failed",
-                code="TRAINING_ERROR",
-                details={"message": str(e)}
-            ).model_dump()
-        )
+    # 7) Save final model
+    model.save(MODEL_PATH)
+    exec_ms = int((time.time() - start_time) * 1000)
+    training_id = f"train_{datetime.datetime.now():%Y%m%d_%H%M%S}"
+    return TrainingResponse(
+        status="success",
+        message="Training completed with anomaly-centered sampling",
+        trainingId=training_id,
+        metrics=TrainingMetrics(accuracy=None, loss=None, f1Score=None),
+        executionTimeMs=exec_ms
+    )
+
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
@@ -366,7 +300,7 @@ async def predict(request: PredictionRequest):
         for discharge in discharges:
             windowed_discharges.extend(
                 discharge.generate_windows(
-                    window_size=500, step = 1, overlap=0.5
+                    window_size=WINDOW_SIZE, step=1, overlap=OVERLAP
                 )
             )
         discharges = windowed_discharges
@@ -376,7 +310,7 @@ async def predict(request: PredictionRequest):
 
         # Make predictions
         predictions = model.predict(X_pred, batch_size=2)
-        predictions = np.where(predictions > 0.5, 1, 0).flatten()
+        probs = np.where(predictions > 0.5, 1, 0).flatten()
         print(f"Predictions: {predictions}")
 
         confidence = np.mean(predictions)
@@ -443,7 +377,7 @@ if __name__ == "__main__":
             logger.error(f"Error loading model: {str(e)}")
             model = None
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=True, 
+    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=False, 
                 limit_concurrency=50, 
                 limit_max_requests=20000,
                 timeout_keep_alive=120)

@@ -1,11 +1,9 @@
 from enum import Enum
-from re import S
-import re
 from typing import Any
-from unittest import signals
-from colorama import init
-import keras
 import numpy as np
+import pandas as pd
+from scipy.ndimage import gaussian_filter1d
+import os
 
 class SignalType(Enum):
     """Enum for signal types."""
@@ -73,16 +71,48 @@ class Discharge:
         self.is_padded = False
         self.is_normalized = False
 
+    def save_to_file(self, folder = None):
+        """
+        Save the discharge to a file.
+        """
+        for s in self.signals:
+            filename = s.label
+            if folder:
+                if not os.path.exists(folder):
+                    os.makedirs(folder)
+                filename = os.path.join(folder, filename)
+            with open(filename, 'w') as f:
+                for time, value in zip(s.times, s.values):
+                    f.write(f"   {time}  {value}\n")
+
     def generate_similar_discharges(self, n: int):
         similar_discharges = []
-        for _ in range(n):
+        for i in range(n):
             new_signals = []
             for signal in self.signals:
-                new_signal = Signal(signal.label, signal.times, signal.values.copy(), signal.signal_type, signal.disruption_class)
-                new_signal.values = np.random.normal(new_signal.values, 0.1).tolist()
+                new_label = signal.label.removesuffix('.txt') + f"_similar_{i}.txt"
+                new_signal = Signal(new_label, signal.times, signal.values.copy(), signal.signal_type, signal.disruption_class)
+
+
+                raw_noise = np.random.normal(loc=0.0, scale=1.0, size=len(signal.values))
+
+                sigma = len(signal.values) * 0.05   # 5% de la longitud de la señal
+                smooth_noise = gaussian_filter1d(raw_noise, sigma=sigma)
+
+                smooth_noise /= np.max(np.abs(smooth_noise))
+                variation = 0.005
+                perturbation = np.array(signal.values) * (variation * smooth_noise)
+
+                # nueva señal
+                new_signal.values = (np.array(signal.values) + perturbation).tolist()
                 new_signals.append(new_signal)
 
             similar_discharges.append(Discharge(new_signals, self.disruption_class))
+
+        # Save for debugging
+        for i, discharge in enumerate(similar_discharges):
+            discharge.save_to_file(folder=f"similar_discharges_{i}")
+
         return similar_discharges
     
     def generate_windows(self, window_size: int, step: int = 1, overlap: float = 0.5):
@@ -236,6 +266,54 @@ def get_X_y(discharges: list[Discharge]) -> tuple[list[list[float]], list[int]]:
     y = [discharge.disruption_class.value for discharge in discharges]
 
     return X, y
+
+def generate_more_discharges(discharges: list[Discharge], sqrt_n: int) -> list[Discharge]:
+    """
+    Generate more discharges from a list of discharges.
+    :param discharges: The list of discharges to generate more from.
+    :param sqrt_n: The square root of the total number of discharges to generate.
+    :return: The generated discharges.
+    """
+    new_discharges = []
+
+    # 1) Group by disruption class
+    grouped_discharges = {}
+    for discharge in discharges:
+        if discharge.disruption_class not in grouped_discharges:
+            grouped_discharges[discharge.disruption_class] = []
+        grouped_discharges[discharge.disruption_class].append(discharge)
+    
+    # 2) Group the signals by type and by disruption class
+    grouped_signals = {}
+    for discharge in discharges:
+        for signal in discharge.signals:
+            if signal.signal_type not in grouped_signals:
+                grouped_signals[signal.signal_type] = {}
+            if discharge.disruption_class not in grouped_signals[signal.signal_type]:
+                grouped_signals[signal.signal_type][discharge.disruption_class] = []
+            grouped_signals[signal.signal_type][discharge.disruption_class].append(signal)
+    
+    # 3) Mix the signals of the same type and class
+    for _, disruption_classes in grouped_signals.items():
+        for disruption_class, signals in disruption_classes.items():
+            # Shuffle the signals of the same type and class
+            np.random.shuffle(signals)
+            # Create new discharges with the shuffled signals
+            for i in range(sqrt_n):
+                new_signals = []
+                for signal in signals:
+                    # Use a new variable for the new label instead of modifying the original
+                    new_label = signal.label.removesuffix('.txt') + f"_new_{i}.txt"
+                    new_signal = Signal(new_label, signal.times, signal.values.copy(), signal.signal_type, disruption_class)
+                    new_signals.append(new_signal)
+                new_discharges.append(Discharge(new_signals, disruption_class))    
+    
+    for discharge in discharges:
+        # Generate similar discharges for each discharge
+        similar_discharges = discharge.generate_similar_discharges(sqrt_n)
+        new_discharges.extend(similar_discharges)
+
+    return new_discharges
 
 
 if __name__ == "__main__":
