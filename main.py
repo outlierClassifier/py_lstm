@@ -9,11 +9,11 @@ import tensorflow as tf
 import pandas as pd
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
+import requests
 import time
 import datetime
 import os
 import pickle
-import psutil
 import logging
 
 PATTERN = "DES_(\\d+)_(\\d+)"
@@ -36,15 +36,22 @@ class Discharge(BaseModel):
     anomalyTime: Optional[float] = None
     signals: List[Signal]
 
-class PredictionRequest(BaseModel):
-    discharges: List[Discharge]
+class StartTrainingRequest(BaseModel):
+    totalDischarges: int = Field(..., ge=1)
+    timeoutSeconds: int = Field(..., ge=1)
+
+class StartTrainingResponse(BaseModel):
+    expectedDischarges: int = Field(..., ge=0)
+
+class DischargeAck(BaseModel):
+    ordinal: int
+    totalDischarges: int
 
 class PredictionResponse(BaseModel):
-    prediction: int
+    prediction: str
     confidence: float
     executionTimeMs: float
     model: str
-    details: Optional[Dict[str, Any]] = None
 
 class TrainingOptions(BaseModel):
     epochs: Optional[int] = None
@@ -67,16 +74,9 @@ class TrainingResponse(BaseModel):
     metrics: Optional[TrainingMetrics] = None
     executionTimeMs: float
 
-class MemoryInfo(BaseModel):
-    total: float
-    used: float
-
 class HealthCheckResponse(BaseModel):
-    status: str
-    version: str
+    name: str
     uptime: float
-    memory: MemoryInfo
-    load: float
     lastTraining: Optional[str] = None
 
 class ErrorResponse(BaseModel):
@@ -98,6 +98,9 @@ start_time = time.time()
 last_training_time = None
 model = None
 scaler = None
+training_session = None
+training_in_progress = False
+webhook_url = os.getenv("WEBHOOK_URL")
 
 # Load model and scaler if they exist
 if os.path.exists(MODEL_PATH):
@@ -360,72 +363,89 @@ def train_lstm_model(X_train, y_train, options: Optional[TrainingOptions] = None
     
     return model, metrics
 
-@app.post("/train", response_model=TrainingResponse)
-async def train_model(request: TrainingRequest):
+def perform_training(discharges: List[Discharge], options: Optional[TrainingOptions] = None) -> TrainingResponse:
     global model, scaler, last_training_time
-    
+
     start_execution = time.time()
-    
-    try:
-        # Prepare features using the old model's approach
-        X_train, y_train, new_scaler = prepare_features_for_lstm(request.discharges)
-        logger.info(f"Training data shape: {X_train.shape}, Labels: {np.sum(y_train)} anomalies out of {len(y_train)}")
-        
-        # Train model
-        trained_model, metrics = train_lstm_model(X_train, y_train, request.options)
-        model = trained_model
-        scaler = new_scaler
-        
-        # Save the model and scaler
-        with open(MODEL_PATH, "wb") as f:
-            pickle.dump(model, f)
-        with open(SCALER_PATH, "wb") as f:
-            pickle.dump(scaler, f)
-        
-        logger.info(f"Model saved to {MODEL_PATH}")
-        logger.info(f"Scaler saved to {SCALER_PATH}")
-        
-        # Calculate execution time
-        execution_time = (time.time() - start_execution) * 1000  # ms
-        
-        # Generate training ID
-        training_id = f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    X_train, y_train, new_scaler = prepare_features_for_lstm(discharges)
+    logger.info(f"Training data shape: {X_train.shape}, Labels: {np.sum(y_train)} anomalies out of {len(y_train)}")
 
-        # Save the model
-        with open(MODEL_PATH, "wb") as f:
-            pickle.dump(model, f)
-        logger.info(f"Model saved to {MODEL_PATH}")
-        last_training_time = datetime.datetime.now().isoformat()
+    trained_model, metrics = train_lstm_model(X_train, y_train, options)
+    model = trained_model
+    scaler = new_scaler
 
-        return TrainingResponse(
-            status="success",
-            message="Training completed successfully",
-            trainingId=training_id,
-            metrics=TrainingMetrics(
-                accuracy=metrics['accuracy'],
-                loss=metrics['loss'],
-                f1Score=metrics['accuracy']  # Approximation, replace with actual F1 if available
-            ),
-            executionTimeMs=execution_time
-        )
-        
-    except Exception as e:
-        logger.error(f"Training error: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail=ErrorResponse(
-                error="Training failed",
-                code="TRAINING_ERROR",
-                details={"message": str(e)}
-            ).dict()
-        )
+    with open(MODEL_PATH, "wb") as f:
+        pickle.dump(model, f)
+    with open(SCALER_PATH, "wb") as f:
+        pickle.dump(scaler, f)
+
+    logger.info(f"Model saved to {MODEL_PATH}")
+    logger.info(f"Scaler saved to {SCALER_PATH}")
+
+    execution_time = (time.time() - start_execution) * 1000
+    training_id = f"train_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    last_training_time = datetime.datetime.now().isoformat()
+
+    return TrainingResponse(
+        status="SUCCESS",
+        message="Training completed successfully",
+        trainingId=training_id,
+        metrics=TrainingMetrics(
+            accuracy=metrics['accuracy'],
+            loss=metrics['loss'],
+            f1Score=metrics['accuracy']
+        ),
+        executionTimeMs=execution_time
+    )
+
+
+@app.post("/train", response_model=StartTrainingResponse)
+async def start_training(request: StartTrainingRequest):
+    global training_session, training_in_progress
+    if training_session is not None or training_in_progress:
+        raise HTTPException(status_code=503, detail="Node is busy or cannot train now")
+
+    training_session = {
+        "total": request.totalDischarges,
+        "timeout": request.timeoutSeconds,
+        "discharges": [],
+    }
+    return StartTrainingResponse(expectedDischarges=request.totalDischarges)
+
+
+@app.post("/train/{ordinal}", response_model=DischargeAck)
+async def push_discharge(ordinal: int, discharge: Discharge):
+    global training_session, training_in_progress
+    if training_session is None:
+        raise HTTPException(status_code=400, detail="No active training session")
+
+    if ordinal != len(training_session["discharges"]) + 1 or ordinal > training_session["total"]:
+        raise HTTPException(status_code=400, detail="Invalid ordinal")
+
+    training_session["discharges"].append(discharge)
+    ack = DischargeAck(ordinal=ordinal, totalDischarges=training_session["total"])
+
+    if ordinal == training_session["total"]:
+        training_in_progress = True
+        result = perform_training(training_session["discharges"])
+        training_in_progress = False
+        training_session = None
+
+        if webhook_url:
+            try:
+                requests.post(f"{webhook_url}/trainingCompleted", json=result.dict())
+            except Exception as e:
+                logger.error(f"Webhook failed: {e}")
+
+    return ack
+
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
+async def predict(discharge: Discharge):
     global model, scaler
-    
+
     start_execution = time.time()
-    logger.info(f"Received prediction request with {len(request.discharges)} discharges")
+    logger.info("Received prediction request")
     
     if model is None or scaler is None:
         raise HTTPException(
@@ -439,7 +459,7 @@ async def predict(request: PredictionRequest):
     
     try:
         # Prepare features for prediction using the old model's approach
-        X_predict = prepare_features_for_prediction(request.discharges, scaler)
+        X_predict = prepare_features_for_prediction([discharge], scaler)
         logger.info(f"Prediction data shape: {X_predict.shape}")
         
         # Make predictions
@@ -455,15 +475,10 @@ async def predict(request: PredictionRequest):
         execution_time = (time.time() - start_execution) * 1000  # ms
         
         return PredictionResponse(
-            prediction=int(final_prediction),
+            prediction="Anomaly" if final_prediction == 1 else "Normal",
             confidence=float(confidence),
             executionTimeMs=execution_time,
-            model="lstm",
-            details={
-                "individualPredictions": binary_predictions.tolist(),
-                "individualConfidences": raw_predictions.flatten().tolist(),
-                "numDischargesProcessed": len(request.discharges)
-            }
+            model="lstm"
         )
         
     except Exception as e:
@@ -479,18 +494,9 @@ async def predict(request: PredictionRequest):
 
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_check():
-    # Get memory information
-    mem = psutil.virtual_memory()
-    
     return HealthCheckResponse(
-        status="online" if model is not None else "degraded",
-        version="1.0.0",
+        name=os.getenv("NODE_NAME", "lstm"),
         uptime=time.time() - start_time,
-        memory=MemoryInfo(
-            total=mem.total / (1024*1024),  # Convert to MB
-            used=mem.used / (1024*1024)
-        ),
-        load=psutil.cpu_percent() / 100,
         lastTraining=last_training_time
     )
 
