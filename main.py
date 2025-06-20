@@ -8,12 +8,12 @@ import numpy as np
 import tensorflow as tf
 import pandas as pd
 from typing import List, Dict, Any, Optional
+from enum import Enum
 from pydantic import BaseModel, Field
 import time
 import datetime
 import os
 import pickle
-import psutil
 import logging
 
 PATTERN = "DES_(\\d+)_(\\d+)"
@@ -24,32 +24,48 @@ logger = logging.getLogger(__name__)
 
 # Define Pydantic models for request/response based on API schemas
 class Signal(BaseModel):
-    fileName: str
+    filename: str = Field(alias="fileName")
     values: List[float]
-    times: Optional[List[float]] = None
-    length: Optional[int] = None
+
+    class Config:
+        allow_population_by_field_name = True
 
 class Discharge(BaseModel):
     id: str
-    times: Optional[List[float]] = None
-    length: Optional[int] = None
-    anomalyTime: Optional[float] = None
     signals: List[Signal]
+    times: List[float]
+    length: int
+    # not part of the official schema but kept for legacy training code
+    anomalyTime: Optional[float] = None
 
 class PredictionRequest(BaseModel):
-    discharges: List[Discharge]
+    discharge: Discharge
+
+class PredictionEnum(str, Enum):
+    Normal = "Normal"
+    Anomaly = "Anomaly"
 
 class PredictionResponse(BaseModel):
-    prediction: int
+    prediction: PredictionEnum
     confidence: float
     executionTimeMs: float
     model: str
-    details: Optional[Dict[str, Any]] = None
 
 class TrainingOptions(BaseModel):
     epochs: Optional[int] = None
     batchSize: Optional[int] = None
     hyperparameters: Optional[Dict[str, Any]] = None
+
+class StartTrainingRequest(BaseModel):
+    totalDischarges: int = Field(..., ge=1)
+    timeoutSeconds: int = Field(..., ge=1)
+
+class StartTrainingResponse(BaseModel):
+    expectedDischarges: int
+
+class DischargeAck(BaseModel):
+    ordinal: int
+    totalDischarges: int
 
 class TrainingRequest(BaseModel):
     discharges: List[Discharge]
@@ -67,17 +83,10 @@ class TrainingResponse(BaseModel):
     metrics: Optional[TrainingMetrics] = None
     executionTimeMs: float
 
-class MemoryInfo(BaseModel):
-    total: float
-    used: float
-
 class HealthCheckResponse(BaseModel):
-    status: str
-    version: str
+    name: str
     uptime: float
-    memory: MemoryInfo
-    load: float
-    lastTraining: Optional[str] = None
+    lastTraining: str
 
 class ErrorResponse(BaseModel):
     error: str
@@ -95,9 +104,10 @@ app = FastAPI(
 MODEL_PATH = "lstm_model.h5"
 SCALER_PATH = "scaler.pkl"
 start_time = time.time()
-last_training_time = None
+last_training_time = "1970-01-01T00:00:00Z"
 model = None
 scaler = None
+training_session = None
 
 # Load model and scaler if they exist
 if os.path.exists(MODEL_PATH):
@@ -113,11 +123,11 @@ if os.path.exists(MODEL_PATH):
 
 def get_sensor_id(signal: Signal) -> str:
     """Extract sensor ID from signal file name"""
-    match = re.match(PATTERN, signal.fileName)
+    match = re.match(PATTERN, signal.filename)
     if match:
         return match.group(2)
     else:
-        raise ValueError(f"Invalid signal file name format: {signal.fileName}")
+        raise ValueError(f"Invalid signal file name format: {signal.filename}")
 
 def sliding_normalized_windows(discharges: list[Discharge], window_size: int, overlap: float):
     """
@@ -360,8 +370,7 @@ def train_lstm_model(X_train, y_train, options: Optional[TrainingOptions] = None
     
     return model, metrics
 
-@app.post("/train", response_model=TrainingResponse)
-async def train_model(request: TrainingRequest):
+async def run_training(request: TrainingRequest) -> TrainingResponse:
     global model, scaler, last_training_time
     
     start_execution = time.time()
@@ -408,11 +417,11 @@ async def train_model(request: TrainingRequest):
             ),
             executionTimeMs=execution_time
         )
-        
+
     except Exception as e:
         logger.error(f"Training error: {str(e)}")
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=ErrorResponse(
                 error="Training failed",
                 code="TRAINING_ERROR",
@@ -420,12 +429,50 @@ async def train_model(request: TrainingRequest):
             ).dict()
         )
 
+
+@app.post("/train", response_model=StartTrainingResponse)
+async def start_training(request: StartTrainingRequest):
+    global training_session
+
+    if training_session is not None:
+        raise HTTPException(status_code=503, detail="Node is busy")
+
+    training_session = {"total": request.totalDischarges, "discharges": []}
+    return StartTrainingResponse(expectedDischarges=request.totalDischarges)
+
+
+@app.post("/train/{ordinal}", response_model=DischargeAck)
+async def push_discharge(ordinal: int, discharge: Discharge):
+    global training_session
+
+    if training_session is None:
+        raise HTTPException(status_code=400, detail="No training session")
+
+    if ordinal != len(training_session["discharges"]) + 1 or ordinal > training_session["total"]:
+        raise HTTPException(status_code=400, detail="Invalid ordinal")
+
+    training_session["discharges"].append(discharge)
+    ack = DischargeAck(ordinal=ordinal, totalDischarges=training_session["total"])
+
+    if ordinal == training_session["total"]:
+        resp = await run_training(TrainingRequest(discharges=training_session["discharges"]))
+        training_session = None
+        callback = os.getenv("TRAINING_CALLBACK_URL")
+        if callback:
+            try:
+                import httpx
+                httpx.post(callback, json=resp.dict())
+            except Exception as e:
+                logger.error(f"Training callback failed: {e}")
+
+    return ack
+
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(request: PredictionRequest):
     global model, scaler
-    
+
     start_execution = time.time()
-    logger.info(f"Received prediction request with {len(request.discharges)} discharges")
+    logger.info("Received prediction request")
     
     if model is None or scaler is None:
         raise HTTPException(
@@ -439,14 +486,11 @@ async def predict(request: PredictionRequest):
     
     try:
         # Prepare features for prediction using the old model's approach
-        X_predict = prepare_features_for_prediction(request.discharges, scaler)
+        X_predict = prepare_features_for_prediction([request.discharge], scaler)
         logger.info(f"Prediction data shape: {X_predict.shape}")
         
         # Make predictions
         raw_predictions = model.predict(X_predict)
-        binary_predictions = (raw_predictions > 0.5).astype(int).flatten()
-        
-        # Calculate final prediction and confidence
         avg_prediction = float(np.mean(raw_predictions))
         final_prediction = 1 if avg_prediction > 0.5 else 0
         confidence = avg_prediction if final_prediction == 1 else 1 - avg_prediction
@@ -455,15 +499,10 @@ async def predict(request: PredictionRequest):
         execution_time = (time.time() - start_execution) * 1000  # ms
         
         return PredictionResponse(
-            prediction=int(final_prediction),
+            prediction=PredictionEnum.Anomaly if final_prediction == 1 else PredictionEnum.Normal,
             confidence=float(confidence),
             executionTimeMs=execution_time,
-            model="lstm",
-            details={
-                "individualPredictions": binary_predictions.tolist(),
-                "individualConfidences": raw_predictions.flatten().tolist(),
-                "numDischargesProcessed": len(request.discharges)
-            }
+            model="lstm"
         )
         
     except Exception as e:
@@ -479,18 +518,9 @@ async def predict(request: PredictionRequest):
 
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_check():
-    # Get memory information
-    mem = psutil.virtual_memory()
-    
     return HealthCheckResponse(
-        status="online" if model is not None else "degraded",
-        version="1.0.0",
+        name="lstm",
         uptime=time.time() - start_time,
-        memory=MemoryInfo(
-            total=mem.total / (1024*1024),  # Convert to MB
-            used=mem.used / (1024*1024)
-        ),
-        load=psutil.cpu_percent() / 100,
         lastTraining=last_training_time
     )
 
