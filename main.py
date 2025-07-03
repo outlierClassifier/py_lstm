@@ -6,7 +6,7 @@ import logging
 from typing import List, Dict, Any, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel
 from sklearn.preprocessing import StandardScaler
 
@@ -48,8 +48,19 @@ class Discharge(BaseModel):
     anomalyTime: Optional[float] = None
     signals: List[Signal]
 
+class StartTrainingRequest(BaseModel):
+    totalDischarges: int
+    timeoutSeconds: int
+
+class StartTrainingResponse(BaseModel):
+    expectedDischarges: int
+
+class DischargeAck(BaseModel):
+    ordinal: int
+    totalDischarges: int
+
 class PredictionRequest(BaseModel):
-    discharges: List[Discharge]
+    discharge: Discharge
 
 class PredictionResponse(BaseModel):
     prediction: int
@@ -61,7 +72,7 @@ class PredictionResponse(BaseModel):
 class TrainingOptions(BaseModel):
     epochs: Optional[int] = 10
     batchSize: Optional[int] = 128
-    modelType: Optional[str] = "ensemble"  # cnn | lstm | transformer | ensemble
+    modelType: Optional[str] = "autoencoder"  # default to unsupervised
     learningRate: Optional[float] = 1e-3
 
 class TrainingRequest(BaseModel):
@@ -80,16 +91,9 @@ class TrainingResponse(BaseModel):
     metrics: Optional[TrainingMetrics] = None
     executionTimeMs: float
 
-class MemoryInfo(BaseModel):
-    total: float
-    used: float
-
 class HealthCheckResponse(BaseModel):
-    status: str
-    version: str
+    name: str
     uptime: float
-    memory: MemoryInfo
-    load: float
     lastTraining: Optional[str] = None
 
 def get_sensor_id(signal: Signal) -> str:
@@ -321,15 +325,16 @@ last_training_time = None
 ensemble: Optional[Ensemble] = None
 autoencoder: Optional[LSTMAutoencoder] = None
 tau_value: Optional[float] = None
+expected_discharges: int = 0
+buffered_discharges: List[Discharge] = []
 
-@app.post("/train", response_model=TrainingResponse)
-async def train_api(req: TrainingRequest):
+
+def run_training_job(discharges: List[Discharge], opts: TrainingOptions = TrainingOptions()):
+    """Internal training logic."""
     global ensemble, autoencoder, tau_value, last_training_time
     tic = time.time()
-
-    opts = req.options or TrainingOptions()
-    scaler_map = build_scalers(req.discharges)
-    X, y = prepare_windows(req.discharges, scaler_map)
+    scaler_map = build_scalers(discharges)
+    X, y = prepare_windows(discharges, scaler_map)
 
     if opts.modelType == "autoencoder":
         normal_idx = np.where(y == 0)[0]
@@ -339,19 +344,13 @@ async def train_api(req: TrainingRequest):
         torch.save(autoencoder.state_dict(), AE_PATH)
         calib_loader = DataLoader(WindowDataset(X, y), batch_size=opts.batchSize, shuffle=False)
         tau_value = compute_threshold(autoencoder, calib_loader)
-        model_name = "autoencoder"
     else:
-        # Dataset & sampler para mitigar desbalance
         dataset = WindowDataset(X, y)
         class_counts = np.bincount(y.astype(int))
         class_weights = 1.0 / torch.tensor(class_counts, dtype=torch.float)
         weights = class_weights[y.astype(int)]
         sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-
         loader = DataLoader(dataset, batch_size=opts.batchSize, sampler=sampler, pin_memory=True)
-
-        logger.info(f"Dataset ventanas: {len(dataset)}; anomaly ratio: {class_counts[1]/len(y):.3f}")
-
         if opts.modelType in ("cnn", "ensemble"):
             cnn = train_single(DilatedCNN(), loader, opts.epochs, opts.learningRate)
         if opts.modelType in ("lstm", "ensemble"):
@@ -360,42 +359,54 @@ async def train_api(req: TrainingRequest):
             trf = train_single(TimeSeriesTransformer(), loader, opts.epochs, opts.learningRate)
         if opts.modelType == "ensemble":
             ensemble = Ensemble(cnn, lstm, trf).to(DEVICE)
-            # Freeze individual models
-            for p in ensemble.cnn.parameters(): p.requires_grad = False
-            for p in ensemble.lstm.parameters(): p.requires_grad = False
-            for p in ensemble.trf.parameters(): p.requires_grad = False
-        # Fine‑tune only weights
-        ensemble.train()
-        opt_ens = optim.Adam([ensemble.weights], lr=1e-2)
-        for _ in range(20):
-            total = 0.0
-            for Xb, yb in loader:
-                Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
-                opt_ens.zero_grad()
-                preds = ensemble(Xb)
-                loss = F.binary_cross_entropy(preds, yb)
-                loss.backward()
-                opt_ens.step()
-                total += loss.item() * Xb.size(0)
+            for p in ensemble.cnn.parameters():
+                p.requires_grad = False
+            for p in ensemble.lstm.parameters():
+                p.requires_grad = False
+            for p in ensemble.trf.parameters():
+                p.requires_grad = False
+            ensemble.train()
+            opt_ens = optim.Adam([ensemble.weights], lr=1e-2)
+            for _ in range(20):
+                for Xb, yb in loader:
+                    Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
+                    opt_ens.zero_grad()
+                    preds = ensemble(Xb)
+                    loss = F.binary_cross_entropy(preds, yb)
+                    loss.backward()
+                    opt_ens.step()
             torch.save(ensemble.state_dict(), ENSEMBLE_PATH)
-            model_name = "ensemble"
-        else:
-            # Save single model
-            path = os.path.join(MODEL_DIR, f"{opts.modelType}.pt")
-            torch.save(eval(opts.modelType).state_dict(), path)
-            model_name = opts.modelType
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     last_training_time = datetime.datetime.utcnow().isoformat()
+    logger.info(f"Training completed in {(time.time() - tic) * 1000:.2f} ms")
 
-    toc = (time.time() - tic) * 1000
-    return TrainingResponse(
-        status="success",
-        message=f"Modelo {model_name} entrenado correctamente",
-        trainingId=f"train_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
-        metrics=TrainingMetrics(),  # Métricas reales se pueden añadir vía MLflow / callback.
-        executionTimeMs=toc,
-    )
+
+@app.post("/train", response_model=StartTrainingResponse)
+async def start_training(req: StartTrainingRequest):
+    global expected_discharges, buffered_discharges
+    if expected_discharges != 0:
+        raise HTTPException(status_code=503, detail="Busy")
+    expected_discharges = req.totalDischarges
+    buffered_discharges = []
+    return StartTrainingResponse(expectedDischarges=expected_discharges)
+
+
+@app.post("/train/{ordinal}", response_model=DischargeAck)
+async def push_discharge(ordinal: int, discharge: Discharge, background_tasks: BackgroundTasks):
+    global expected_discharges, buffered_discharges
+    if expected_discharges == 0:
+        raise HTTPException(status_code=400, detail="Session not started")
+    if ordinal < 1 or ordinal > expected_discharges:
+        raise HTTPException(status_code=400, detail="Invalid ordinal")
+    buffered_discharges.append(discharge)
+    ack = DischargeAck(ordinal=ordinal, totalDischarges=expected_discharges)
+    if ordinal == expected_discharges:
+        background_tasks.add_task(run_training_job, buffered_discharges.copy())
+        expected_discharges = 0
+        buffered_discharges = []
+    return ack
+
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_api(req: PredictionRequest):
@@ -419,8 +430,8 @@ async def predict_api(req: PredictionRequest):
             tau_value = float(np.load(THRESHOLD_PATH))
 
     tic = time.time()
-    scaler_map = build_scalers(req.discharges)
-    X, _ = prepare_windows(req.discharges, scaler_map)
+    scaler_map = build_scalers([req.discharge])
+    X, _ = prepare_windows([req.discharge], scaler_map)
     with torch.no_grad():
         if autoencoder is not None:
             tens = torch.from_numpy(X).to(DEVICE)
@@ -448,17 +459,11 @@ async def predict_api(req: PredictionRequest):
         details={"windows": len(X)}
     )
 
-import psutil
-
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_api():
-    mem = psutil.virtual_memory()
     return HealthCheckResponse(
-        status="online" if any([os.path.exists(ENSEMBLE_PATH), os.path.exists(AE_PATH)]) else "degraded",
-        version="2.0.0",
+        name="node",
         uptime=time.time() - start_time,
-        memory=MemoryInfo(total=mem.total / 1_048_576, used=mem.used / 1_048_576),
-        load=psutil.cpu_percent() / 100,
         lastTraining=last_training_time,
     )
 
