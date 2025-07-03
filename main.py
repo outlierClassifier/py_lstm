@@ -6,7 +6,7 @@ import logging
 from typing import List, Dict, Any, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel
 from sklearn.preprocessing import StandardScaler
 
@@ -26,6 +26,8 @@ torch.manual_seed(SEED)
 
 MODEL_DIR = "artifacts"
 ENSEMBLE_PATH = os.path.join(MODEL_DIR, "ensemble.pt")
+AE_PATH = os.path.join(MODEL_DIR, "autoencoder.pt")
+THRESHOLD_PATH = os.path.join(MODEL_DIR, "tau.npy")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 WINDOW = 2_048       # Number of time steps per window
@@ -34,7 +36,7 @@ STRIDE = 512         # 75 % overlap
 PATTERN = r"DES_(\d+)_(\d+)"
 
 class Signal(BaseModel):
-    fileName: str
+    filename: str
     values: List[float]
     times: Optional[List[float]] = None
     length: Optional[int] = None
@@ -46,20 +48,27 @@ class Discharge(BaseModel):
     anomalyTime: Optional[float] = None
     signals: List[Signal]
 
-class PredictionRequest(BaseModel):
-    discharges: List[Discharge]
+class StartTrainingRequest(BaseModel):
+    totalDischarges: int
+    timeoutSeconds: int
+
+class StartTrainingResponse(BaseModel):
+    expectedDischarges: int
+
+class DischargeAck(BaseModel):
+    ordinal: int
+    totalDischarges: int
 
 class PredictionResponse(BaseModel):
-    prediction: int
+    prediction: str  # "Normal" or "Anomaly"
     confidence: float
     executionTimeMs: float
     model: str
-    details: Optional[Dict[str, Any]] = None
 
 class TrainingOptions(BaseModel):
     epochs: Optional[int] = 10
     batchSize: Optional[int] = 128
-    modelType: Optional[str] = "ensemble"  # cnn | lstm | transformer | ensemble
+    modelType: Optional[str] = "autoencoder"  # default to unsupervised
     learningRate: Optional[float] = 1e-3
 
 class TrainingRequest(BaseModel):
@@ -78,23 +87,16 @@ class TrainingResponse(BaseModel):
     metrics: Optional[TrainingMetrics] = None
     executionTimeMs: float
 
-class MemoryInfo(BaseModel):
-    total: float
-    used: float
-
 class HealthCheckResponse(BaseModel):
-    status: str
-    version: str
+    name: str
     uptime: float
-    memory: MemoryInfo
-    load: float
     lastTraining: Optional[str] = None
 
 def get_sensor_id(signal: Signal) -> str:
     """Extrae id de sensor usando el patrón DES_x_y."""
-    match = re.match(PATTERN, signal.fileName)
+    match = re.match(PATTERN, signal.filename)
     if not match:
-        raise ValueError(f"Nombre de fichero no válido: {signal.fileName}")
+        raise ValueError(f"Nombre de fichero no válido: {signal.filename}")
     return match.group(2)
 
 
@@ -208,6 +210,19 @@ class TimeSeriesTransformer(nn.Module):
         x = x.mean(1)
         return self.cls(x).squeeze(-1)
 
+class LSTMAutoencoder(nn.Module):
+    def __init__(self, hidden=128):
+        super().__init__()
+        self.encoder = nn.LSTM(7, hidden, num_layers=2, batch_first=True)
+        self.decoder = nn.LSTM(hidden, hidden, num_layers=2, batch_first=True)
+        self.output = nn.Linear(hidden, 7)
+
+    def forward(self, x):
+        _, (h, c) = self.encoder(x)
+        dec_in = torch.zeros_like(x[:, :, :self.encoder.hidden_size])
+        out, _ = self.decoder(dec_in, (h, c))
+        return self.output(out)
+
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, reduction="mean"):
         super().__init__()
@@ -247,6 +262,41 @@ def train_single(model: nn.Module, dataloader: DataLoader, epochs: int, lr: floa
     return model
 
 
+def train_autoencoder(model: nn.Module, dataloader: DataLoader, epochs: int, lr: float):
+    model.to(DEVICE)
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    model.train()
+    for epoch in range(epochs):
+        running = 0.0
+        for X, _ in dataloader:
+            X = X.to(DEVICE)
+            optimizer.zero_grad()
+            recon = model(X)
+            loss = criterion(recon, X)
+            loss.backward()
+            optimizer.step()
+            running += loss.item() * X.size(0)
+        scheduler.step()
+        logger.info(f"Epoch {epoch+1}/{epochs} - Loss: {running / len(dataloader.dataset):.4f}")
+    return model
+
+
+def compute_threshold(model: nn.Module, dataloader: DataLoader, fa_rate: float = 0.005) -> float:
+    model.eval()
+    errors = []
+    with torch.no_grad():
+        for X, _ in dataloader:
+            X = X.to(DEVICE)
+            recon = model(X)
+            err = ((recon - X) ** 2).mean(dim=(1, 2)).cpu().numpy()
+            errors.extend(err)
+    tau = float(np.percentile(errors, 100 * (1 - fa_rate)))
+    np.save(THRESHOLD_PATH, tau)
+    return tau
+
+
 class Ensemble(nn.Module):
     def __init__(self, cnn: DilatedCNN, lstm: BiLSTMAttn, trf: TimeSeriesTransformer):
         super().__init__()
@@ -269,115 +319,146 @@ app = FastAPI(title="Disruption Classifier", version="2.0.0")
 start_time = time.time()
 last_training_time = None
 ensemble: Optional[Ensemble] = None
+autoencoder: Optional[LSTMAutoencoder] = None
+tau_value: Optional[float] = None
+expected_discharges: int = 0
+buffered_discharges: List[Discharge] = []
 
-@app.post("/train", response_model=TrainingResponse)
-async def train_api(req: TrainingRequest):
-    global ensemble, last_training_time
+
+def run_training_job(discharges: List[Discharge], opts: TrainingOptions = TrainingOptions()):
+    """Internal training logic."""
+    global ensemble, autoencoder, tau_value, last_training_time
     tic = time.time()
+    scaler_map = build_scalers(discharges)
+    X, y = prepare_windows(discharges, scaler_map)
 
-    opts = req.options or TrainingOptions()
-    scaler_map = build_scalers(req.discharges)
-    X, y = prepare_windows(req.discharges, scaler_map)
-
-    # Dataset & sampler para mitigar desbalance
-    dataset = WindowDataset(X, y)
-    class_counts = np.bincount(y.astype(int))
-    class_weights = 1.0 / torch.tensor(class_counts, dtype=torch.float)
-    weights = class_weights[y.astype(int)]
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-
-    loader = DataLoader(dataset, batch_size=opts.batchSize, sampler=sampler, pin_memory=True)
-
-    logger.info(f"Dataset ventanas: {len(dataset)}; anomaly ratio: {class_counts[1]/len(y):.3f}")
-
-    if opts.modelType in ("cnn", "ensemble"):
-        cnn = train_single(DilatedCNN(), loader, opts.epochs, opts.learningRate)
-    if opts.modelType in ("lstm", "ensemble"):
-        lstm = train_single(BiLSTMAttn(), loader, opts.epochs, opts.learningRate)
-    if opts.modelType in ("transformer", "ensemble"):
-        trf = train_single(TimeSeriesTransformer(), loader, opts.epochs, opts.learningRate)
-
-    if opts.modelType == "ensemble":
-        ensemble = Ensemble(cnn, lstm, trf).to(DEVICE)
-        # Freeze individual models
-        for p in ensemble.cnn.parameters(): p.requires_grad = False
-        for p in ensemble.lstm.parameters(): p.requires_grad = False
-        for p in ensemble.trf.parameters(): p.requires_grad = False
-        # Fine‑tune only weights
-        ensemble.train()
-        opt_ens = optim.Adam([ensemble.weights], lr=1e-2)
-        for _ in range(20):
-            total = 0.0
-            for Xb, yb in loader:
-                Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
-                opt_ens.zero_grad()
-                preds = ensemble(Xb)
-                loss = F.binary_cross_entropy(preds, yb)
-                loss.backward()
-                opt_ens.step()
-                total += loss.item() * Xb.size(0)
-        torch.save(ensemble.state_dict(), ENSEMBLE_PATH)
-        model_name = "ensemble"
+    if opts.modelType == "autoencoder":
+        normal_idx = np.where(y == 0)[0]
+        dataset = WindowDataset(X[normal_idx], y[normal_idx])
+        loader = DataLoader(dataset, batch_size=opts.batchSize, shuffle=True, pin_memory=True)
+        autoencoder = train_autoencoder(LSTMAutoencoder(), loader, opts.epochs, opts.learningRate)
+        torch.save(autoencoder.state_dict(), AE_PATH)
+        calib_loader = DataLoader(WindowDataset(X, y), batch_size=opts.batchSize, shuffle=False)
+        tau_value = compute_threshold(autoencoder, calib_loader)
     else:
-        # Save single model
-        path = os.path.join(MODEL_DIR, f"{opts.modelType}.pt")
-        torch.save(eval(opts.modelType).state_dict(), path)
-        model_name = opts.modelType
+        dataset = WindowDataset(X, y)
+        class_counts = np.bincount(y.astype(int))
+        class_weights = 1.0 / torch.tensor(class_counts, dtype=torch.float)
+        weights = class_weights[y.astype(int)]
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        loader = DataLoader(dataset, batch_size=opts.batchSize, sampler=sampler, pin_memory=True)
+        if opts.modelType in ("cnn", "ensemble"):
+            cnn = train_single(DilatedCNN(), loader, opts.epochs, opts.learningRate)
+        if opts.modelType in ("lstm", "ensemble"):
+            lstm = train_single(BiLSTMAttn(), loader, opts.epochs, opts.learningRate)
+        if opts.modelType in ("transformer", "ensemble"):
+            trf = train_single(TimeSeriesTransformer(), loader, opts.epochs, opts.learningRate)
+        if opts.modelType == "ensemble":
+            ensemble = Ensemble(cnn, lstm, trf).to(DEVICE)
+            for p in ensemble.cnn.parameters():
+                p.requires_grad = False
+            for p in ensemble.lstm.parameters():
+                p.requires_grad = False
+            for p in ensemble.trf.parameters():
+                p.requires_grad = False
+            ensemble.train()
+            opt_ens = optim.Adam([ensemble.weights], lr=1e-2)
+            for _ in range(20):
+                for Xb, yb in loader:
+                    Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
+                    opt_ens.zero_grad()
+                    preds = ensemble(Xb)
+                    loss = F.binary_cross_entropy(preds, yb)
+                    loss.backward()
+                    opt_ens.step()
+            torch.save(ensemble.state_dict(), ENSEMBLE_PATH)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     last_training_time = datetime.datetime.utcnow().isoformat()
+    logger.info(f"Training completed in {(time.time() - tic) * 1000:.2f} ms")
 
-    toc = (time.time() - tic) * 1000
-    return TrainingResponse(
-        status="success",
-        message=f"Modelo {model_name} entrenado correctamente",
-        trainingId=f"train_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
-        metrics=TrainingMetrics(),  # Métricas reales se pueden añadir vía MLflow / callback.
-        executionTimeMs=toc,
-    )
+
+@app.post("/train", response_model=StartTrainingResponse)
+async def start_training(req: StartTrainingRequest):
+    global expected_discharges, buffered_discharges
+    if expected_discharges != 0:
+        raise HTTPException(status_code=503, detail="Busy")
+    expected_discharges = req.totalDischarges
+    buffered_discharges = []
+    return StartTrainingResponse(expectedDischarges=expected_discharges)
+
+
+@app.post("/train/{ordinal}", response_model=DischargeAck)
+async def push_discharge(ordinal: int, discharge: Discharge, background_tasks: BackgroundTasks):
+    global expected_discharges, buffered_discharges
+    if expected_discharges == 0:
+        raise HTTPException(status_code=400, detail="Session not started")
+    if ordinal < 1 or ordinal > expected_discharges:
+        raise HTTPException(status_code=400, detail="Invalid ordinal")
+    buffered_discharges.append(discharge)
+    ack = DischargeAck(ordinal=ordinal, totalDischarges=expected_discharges)
+    if ordinal == expected_discharges:
+        background_tasks.add_task(run_training_job, buffered_discharges.copy())
+        expected_discharges = 0
+        buffered_discharges = []
+    return ack
+
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict_api(req: PredictionRequest):
-    if ensemble is None and not os.path.exists(ENSEMBLE_PATH):
+async def predict_api(discharge: Discharge):
+    global ensemble, autoencoder, tau_value
+    if all([ensemble is None, autoencoder is None]) and not any([os.path.exists(ENSEMBLE_PATH), os.path.exists(AE_PATH)]):
         raise HTTPException(status_code=400, detail="Modelo no entrenado. Llama primero /train")
 
     # Lazy load
-    global ensemble
-    if ensemble is None:
+    if ensemble is None and os.path.exists(ENSEMBLE_PATH) and autoencoder is None:
         cnn = DilatedCNN().to(DEVICE)
         lstm = BiLSTMAttn().to(DEVICE)
         trf = TimeSeriesTransformer().to(DEVICE)
         ensemble = Ensemble(cnn, lstm, trf).to(DEVICE)
         ensemble.load_state_dict(torch.load(ENSEMBLE_PATH, map_location=DEVICE))
         ensemble.eval()
+    if autoencoder is None and os.path.exists(AE_PATH):
+        autoencoder = LSTMAutoencoder().to(DEVICE)
+        autoencoder.load_state_dict(torch.load(AE_PATH, map_location=DEVICE))
+        autoencoder.eval()
+        if tau_value is None and os.path.exists(THRESHOLD_PATH):
+            tau_value = float(np.load(THRESHOLD_PATH))
 
     tic = time.time()
-    scaler_map = build_scalers(req.discharges)
-    X, _ = prepare_windows(req.discharges, scaler_map)
+    scaler_map = build_scalers([discharge])
+    X, _ = prepare_windows([discharge], scaler_map)
     with torch.no_grad():
-        preds = torch.sigmoid(ensemble(torch.from_numpy(X).to(DEVICE))).cpu().numpy()
-    mean_score = preds.mean()
+        if autoencoder is not None:
+            tens = torch.from_numpy(X).to(DEVICE)
+            recon = autoencoder(tens)
+            errs = ((recon - tens) ** 2).mean(dim=(1, 2)).cpu().numpy()
+            mean_score = errs.mean()
+            thresh = tau_value if tau_value is not None else 0.5
+            is_anomaly = mean_score > thresh
+            confidence = float(mean_score / thresh) if is_anomaly else float(1 - mean_score / thresh)
+            model_name = "autoencoder"
+        else:
+            preds = torch.sigmoid(ensemble(torch.from_numpy(X).to(DEVICE))).cpu().numpy()
+            mean_score = preds.mean()
+            thresh = 0.5
+            is_anomaly = mean_score > thresh
+            confidence = float(mean_score if is_anomaly else 1 - mean_score)
+            model_name = "ensemble"
 
     toc = (time.time() - tic) * 1000
     return PredictionResponse(
-        prediction=int(mean_score > 0.5),
-        confidence=float(mean_score if mean_score > 0.5 else 1 - mean_score),
+        prediction="Anomaly" if is_anomaly else "Normal",
+        confidence=confidence,
         executionTimeMs=toc,
-        model="ensemble",
-        details={"windows": len(preds)}
+        model=model_name,
     )
-
-import psutil
 
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_api():
-    mem = psutil.virtual_memory()
     return HealthCheckResponse(
-        status="online" if os.path.exists(ENSEMBLE_PATH) else "degraded",
-        version="2.0.0",
+        name="node",
         uptime=time.time() - start_time,
-        memory=MemoryInfo(total=mem.total / 1_048_576, used=mem.used / 1_048_576),
-        load=psutil.cpu_percent() / 100,
         lastTraining=last_training_time,
     )
 
