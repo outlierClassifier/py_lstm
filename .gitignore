@@ -1,4 +1,7 @@
 # Project-specific files
+*.keras
+*.pkl
+*.txt
 *.h5
 *.txt
 *.keras

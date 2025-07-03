@@ -1,38 +1,40 @@
 import os
 import re
+from fastapi import FastAPI, HTTPException, Request
+import tensorflow as tf
+from tensorflow.keras import Model, Input
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import (
+    Dense, LSTM, Dropout, Masking, GlobalMaxPooling1D, Flatten, 
+    BatchNormalization, Input, Conv1D, Activation, concatenate,
+    MaxPooling1D, SpatialDropout1D, Attention, Bidirectional
+    )
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.regularizers import l2
+from sklearn.model_selection import train_test_split, GroupKFold, GroupShuffleSplit
+from sklearn.utils import class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import uvicorn
+import numpy as np
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field
 import time
 import datetime
 import logging
-from typing import List, Dict, Any, Optional
+from signals import Signal as InternalSignal, Discharge as InternalDischarge, DisruptionClass, get_X_y, get_signal_type, generate_more_discharges, pad
 
-import numpy as np
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
-from sklearn.preprocessing import StandardScaler
+PATTERN = "DES_(\\d+)_(\\d+)"
+WINDOW_SIZE = 500
+OVERLAP = 0.2
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.nn import functional as F
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-LOGGER_FMT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-logging.basicConfig(level=logging.INFO, format=LOGGER_FMT)
-logger = logging.getLogger("disruption-classifier")
-
-SEED = 42
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-
-MODEL_DIR = "artifacts"
-ENSEMBLE_PATH = os.path.join(MODEL_DIR, "ensemble.pt")
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-WINDOW = 2_048       # Nº muestras por ventana
-STRIDE = 512         # Paso de la ventana (75 % solape)
-
-PATTERN = r"DES_(\d+)_(\d+)"
-
+# Define Pydantic models for request/response based on API schemas
 class Signal(BaseModel):
     fileName: str
     values: List[float]
@@ -90,285 +92,253 @@ class HealthCheckResponse(BaseModel):
     load: float
     lastTraining: Optional[str] = None
 
+class ErrorResponse(BaseModel):
+    error: str
+    code: Optional[str] = None
+    details: Optional[Dict[str, Any]] = None
+
+# Initialize FastAPI application
+app = FastAPI(
+    title="LSTM Anomaly Detection API",
+    description="API for anomaly detection using LSTM models",
+    version="1.0.0"
+)
+
+# Global variables
+MODEL_PATH = "lstm_model.keras"
+start_time = time.time()
+last_training_time = None
+model = None
+
+# Load model if exists
+if os.path.exists(MODEL_PATH):
+    try:
+        model = pickle.load(open(MODEL_PATH, "rb"))
+        logger.info("Existing model loaded successfully")
+
+    except Exception as e:
+        logger.error(f"Error loading model: {str(e)}")
+
 def get_sensor_id(signal: Signal) -> str:
     """Extrae id de sensor usando el patrón DES_x_y."""
     match = re.match(PATTERN, signal.fileName)
-    if not match:
-        raise ValueError(f"Nombre de fichero no válido: {signal.fileName}")
-    return match.group(2)
+    if match:
+        return match.group(2)
+    else:
+        raise ValueError(f"Invalid signal file name format: {signal.fileName}")
 
+def focal_loss(gamma=2.0, alpha=0.25):
+    def f1(y_true, y_pred):
+        bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        alpha_t = y_true * alpha + (1 - y_true) * (1 - alpha)
+        return alpha_t * tf.pow((1 - p_t), gamma) * bce
+    return f1
 
-def build_scalers(discharges: List[Discharge]):
-    """Calcula StandardScaler global para cada feature."""
-    sensor_ids = [get_sensor_id(s) for s in discharges[0].signals]
-    scalers: Dict[str, StandardScaler] = {}
-    for sid in sensor_ids:
-        all_values = np.concatenate([
-            np.asarray([s.values for s in d.signals if get_sensor_id(s) == sid], dtype=np.float32).ravel()
-            for d in discharges
-        ]).reshape(-1, 1)
-        scaler = StandardScaler().fit(all_values)
-        scalers[sid] = scaler
-    return scalers
-
-
-def prepare_windows(discharges: List[Discharge], scalers: Dict[str, StandardScaler]):
-    X, y = [], []
-    for d in discharges:
-        # Normaliza cada señal
-        norm_signals = []
-        for s in d.signals:
-            arr = np.asarray(s.values, dtype=np.float32).reshape(-1, 1)
-            arr = scalers[get_sensor_id(s)].transform(arr).ravel()
-            # Clipping p99 para robustez
-            p99 = np.percentile(arr, 99)
-            arr = np.clip(arr, -p99, p99)
-            norm_signals.append(arr)
-        seq_len = len(norm_signals[0])
-        # Sliding windows
-        for start in range(0, seq_len - WINDOW + 1, STRIDE):
-            window = [sig[start:start+WINDOW] for sig in norm_signals]  # -> list[7][WINDOW]
-            X.append(window)
-            y.append(1 if d.anomalyTime is not None else 0)
-    X = np.transpose(np.array(X, dtype=np.float32), (0, 2, 1))  # (samples, time, features)
-    y = np.array(y, dtype=np.float32)
-    return X, y
-
-class WindowDataset(Dataset):
-    def __init__(self, X: np.ndarray, y: np.ndarray):
-        self.X = torch.from_numpy(X)
-        self.y = torch.from_numpy(y)
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-class DilatedCNN(nn.Module):
-    def __init__(self, in_channels: int = 7):
-        super().__init__()
-        dilations = [1, 2, 4, 8, 16, 32]
-        channels = [64, 64, 128, 128, 256, 256]
-        layers = []
-        prev_c = in_channels
-        for d, c in zip(dilations, channels):
-            layers.append(nn.Conv1d(prev_c, c, kernel_size=3, padding=d, dilation=d))
-            layers.append(nn.BatchNorm1d(c))
-            layers.append(nn.ReLU())
-            prev_c = c
-        self.conv = nn.Sequential(*layers)
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(prev_c, 1)
-
-    def forward(self, x):  # x: (B, T, F)
-        x = x.permute(0, 2, 1)          # -> (B, F, T)
-        x = self.conv(x)
-        x = self.pool(x).squeeze(-1)
-        return self.fc(x).squeeze(-1)
-
-class Attention(nn.Module):
-    """Simple additive attention layer."""
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.W = nn.Linear(hidden_dim, hidden_dim)
-        self.v = nn.Linear(hidden_dim, 1, bias=False)
-
-    def forward(self, inputs):  # inputs: (B, T, H)
-        u = torch.tanh(self.W(inputs))
-        scores = self.v(u).squeeze(-1)    # (B, T)
-        weights = F.softmax(scores, dim=1).unsqueeze(-1)
-        return torch.sum(inputs * weights, dim=1)
-
-class BiLSTMAttn(nn.Module):
-    def __init__(self, hidden=160):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size=7, hidden_size=hidden, num_layers=2,
-                            bidirectional=True, batch_first=True, dropout=0.3)
-        self.attn = Attention(hidden*2)
-        self.fc = nn.Linear(hidden*2, 1)
-
-    def forward(self, x):  # (B, T, F)
-        out, _ = self.lstm(x)
-        context = self.attn(out)
-        return self.fc(context).squeeze(-1)
-
-class TimeSeriesTransformer(nn.Module):
-    def __init__(self, d_model=128, nhead=4, num_layers=4):
-        super().__init__()
-        self.input_proj = nn.Linear(7, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.cls = nn.Linear(d_model, 1)
-        self.pos = nn.Parameter(torch.randn(1, WINDOW, d_model))
-
-    def forward(self, x):
-        x = self.input_proj(x) + self.pos[:, :x.size(1)]
-        x = self.transformer(x)
-        x = x.mean(1)
-        return self.cls(x).squeeze(-1)
-
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, reduction="mean"):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, logits, targets):
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        p_t = torch.exp(-bce)
-        loss = self.alpha * (1 - p_t) ** self.gamma * bce
-        if self.reduction == "mean":
-            return loss.mean()
-        return loss.sum()
-
-
-def train_single(model: nn.Module, dataloader: DataLoader, epochs: int, lr: float):
-    model.to(DEVICE)
-    criterion = FocalLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    model.train()
-    for epoch in range(epochs):
-        running = 0.0
-        for X, y in dataloader:
-            X = X.to(DEVICE)
-            y = y.to(DEVICE)
-            optimizer.zero_grad()
-            logits = model(X)
-            loss = criterion(logits, y)
-            loss.backward()
-            optimizer.step()
-            running += loss.item() * X.size(0)
-        scheduler.step()
-        logger.info(f"Epoch {epoch+1}/{epochs} - Loss: {running / len(dataloader.dataset):.4f}")
-
-    return model
-
-
-class Ensemble(nn.Module):
-    def __init__(self, cnn: DilatedCNN, lstm: BiLSTMAttn, trf: TimeSeriesTransformer):
-        super().__init__()
-        self.cnn = cnn
-        self.lstm = lstm
-        self.trf = trf
-        self.weights = nn.Parameter(torch.tensor([1.0, 1.0, 1.0]))
-
-    def forward(self, x):
-        preds = torch.stack([
-            torch.sigmoid(self.cnn(x)),
-            torch.sigmoid(self.lstm(x)),
-            torch.sigmoid(self.trf(x))
-        ], dim=1)  # (B, 3)
-        w = torch.softmax(self.weights, dim=0)
-        return (preds * w).sum(1)
-
-app = FastAPI(title="Disruption Classifier", version="2.0.0")
-
-start_time = time.time()
-last_training_time = None
-ensemble: Optional[Ensemble] = None
+def is_anomaly(discharge: Discharge) -> bool:
+    """Determine if a discharge has an anomaly based on anomalyTime"""
+    return discharge.anomalyTime is not None
 
 @app.post("/train", response_model=TrainingResponse)
-async def train_api(req: TrainingRequest):
-    global ensemble, last_training_time
-    tic = time.time()
+async def train_model(request: TrainingRequest):
+    global MODEL_PATH
+    start_time = time.time()
 
-    opts = req.options or TrainingOptions()
-    scaler_map = build_scalers(req.discharges)
-    X, y = prepare_windows(req.discharges, scaler_map)
+    # 1) Parse discharges into InternalDischarge
+    internal = []
+    for d in request.discharges:
+        signals = [InternalSignal(
+            label=s.fileName,
+            times=s.times or d.times,
+            values=s.values,
+            signal_type=get_signal_type(get_sensor_id(s)),
+            disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)
+        ) for s in d.signals]
+        internal.append(InternalDischarge(
+            signals=signals,
+            disruption_class=(DisruptionClass.Anomaly if d.anomalyTime else DisruptionClass.Normal)
+        ))
 
-    # Dataset & sampler para mitigar desbalance
-    dataset = WindowDataset(X, y)
-    class_counts = np.bincount(y.astype(int))
-    class_weights = 1.0 / torch.tensor(class_counts, dtype=torch.float)
-    weights = class_weights[y.astype(int)]
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    # 2) Optional minimal augmentation
+    if len(internal) < 10:
+        augmented = []
+        for disc in internal:
+            augmented.extend(disc.generate_similar_discharges(1))
+        internal += augmented
 
-    loader = DataLoader(dataset, batch_size=opts.batchSize, sampler=sampler, pin_memory=True)
+    # 3) Windowing + strategic sampling
+    WINDOW_SIZE = 500
+    OVERLAP = 0.3
+    SAMPLE_PER_DISCHARGE = 80  # incrementar ventanas totales
+    windowed, groups = [], []
 
-    logger.info(f"Dataset ventanas: {len(dataset)}; anomaly ratio: {class_counts[1]/len(y):.3f}")
+    for disc_id, disc in enumerate(internal):
+        wins = disc.generate_windows(window_size=WINDOW_SIZE, step=1, overlap=OVERLAP)
+        total_wins = len(wins)
 
-    if opts.modelType in ("cnn", "ensemble"):
-        cnn = train_single(DilatedCNN(), loader, opts.epochs, opts.learningRate)
-    if opts.modelType in ("lstm", "ensemble"):
-        lstm = train_single(BiLSTMAttn(), loader, opts.epochs, opts.learningRate)
-    if opts.modelType in ("transformer", "ensemble"):
-        trf = train_single(TimeSeriesTransformer(), loader, opts.epochs, opts.learningRate)
+        # Si es anomalía, centramos alrededor del punto de disrupción
+        if disc.disruption_class == DisruptionClass.Anomaly and total_wins > SAMPLE_PER_DISCHARGE:
+            # Tomar mitad de ventanas alrededor de la anomalía
+            center = total_wins // 2
+            half = SAMPLE_PER_DISCHARGE // 2
+            start = max(0, center - half)
+            end = min(total_wins, center + half)
+            idxs = np.arange(start, end)
+            # Si no hay suficientes en el rango, rellenar uniformemente
+            if len(idxs) < SAMPLE_PER_DISCHARGE:
+                extra = np.setdiff1d(np.arange(total_wins), idxs)
+                pick = np.random.choice(extra, SAMPLE_PER_DISCHARGE - len(idxs), replace=False)
+                idxs = np.concatenate([idxs, pick])
+        elif total_wins > SAMPLE_PER_DISCHARGE:
+            # No-disruptiva o pocas ventanas: muestreo uniforme
+            idxs = np.linspace(0, total_wins - 1, SAMPLE_PER_DISCHARGE, dtype=int)
+        else:
+            idxs = np.arange(total_wins)
 
-    if opts.modelType == "ensemble":
-        ensemble = Ensemble(cnn, lstm, trf).to(DEVICE)
-        # Freeze individual models
-        for p in ensemble.cnn.parameters(): p.requires_grad = False
-        for p in ensemble.lstm.parameters(): p.requires_grad = False
-        for p in ensemble.trf.parameters(): p.requires_grad = False
-        # Fine‑tune only weights
-        ensemble.train()
-        opt_ens = optim.Adam([ensemble.weights], lr=1e-2)
-        for _ in range(20):
-            total = 0.0
-            for Xb, yb in loader:
-                Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
-                opt_ens.zero_grad()
-                preds = ensemble(Xb)
-                loss = F.binary_cross_entropy(preds, yb)
-                loss.backward()
-                opt_ens.step()
-                total += loss.item() * Xb.size(0)
-        torch.save(ensemble.state_dict(), ENSEMBLE_PATH)
-        model_name = "ensemble"
-    else:
-        # Save single model
-        path = os.path.join(MODEL_DIR, f"{opts.modelType}.pt")
-        torch.save(eval(opts.modelType).state_dict(), path)
-        model_name = opts.modelType
+        sampled_wins = [wins[i] for i in idxs]
+        windowed.extend(sampled_wins)
+        groups.extend([disc_id] * len(sampled_wins))
 
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    last_training_time = datetime.datetime.utcnow().isoformat()
+    # 4) Build input arrays
+    X_list, y_list = get_X_y(windowed)
+    X = np.stack([np.array(sig).T for sig in X_list])  # shape (n_windows, time, sensors)
+    y = np.array(y_list)
+    groups = np.array(groups)
 
-    toc = (time.time() - tic) * 1000
+    # 5) Model factory
+    def build_model():
+        inp = Input(shape=(WINDOW_SIZE, X.shape[-1]))
+        x = Masking(mask_value=0.0)(inp)
+        x = Bidirectional(LSTM(32, return_sequences=False))(x)
+        x = Dropout(0.2)(x)
+        x = Dense(16, activation="relu")(x)
+        x = Dropout(0.2)(x)
+        out = Dense(1, activation="sigmoid")(x)
+        m = Model(inp, out)
+        m.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+        return m
+
+    # 6) Leave-One-Discharge-Out CV
+    cv = GroupShuffleSplit(n_splits=8, test_size=0.25, random_state=42)
+    for fold, (tr_idx, val_idx) in enumerate(cv.split(X, y, groups), start=1):
+        print(f"--- Fold {fold}/8 ---")
+        X_tr, y_tr = X[tr_idx], y[tr_idx]
+        X_val, y_val = X[val_idx], y[val_idx]
+
+        model = build_model()
+        callbacks = [
+            EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+        ]
+
+        model.fit(
+            X_tr, y_tr,
+            validation_data=(X_val, y_val),
+            epochs=50,
+            batch_size=8,
+            callbacks=callbacks,
+            shuffle=True
+        )
+
+        probs = model.predict(X_val).ravel()
+        threshold = 0.5
+        preds = (probs > threshold).astype(int)
+        report = classification_report(y_val, preds, labels=[0,1], target_names=["Normal","Anomaly"], zero_division=0)
+        print(f"Fold {fold} report:\n{report}")
+
+    # 7) Save final model
+    model.save(MODEL_PATH)
+    exec_ms = int((time.time() - start_time) * 1000)
+    training_id = f"train_{datetime.datetime.now():%Y%m%d_%H%M%S}"
     return TrainingResponse(
         status="success",
-        message=f"Modelo {model_name} entrenado correctamente",
-        trainingId=f"train_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
-        metrics=TrainingMetrics(),  # Métricas reales se pueden añadir vía MLflow / callback.
-        executionTimeMs=toc,
+        message="Training completed with anomaly-centered sampling",
+        trainingId=training_id,
+        metrics=TrainingMetrics(accuracy=None, loss=None, f1Score=None),
+        executionTimeMs=exec_ms
     )
+
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict_api(req: PredictionRequest):
-    if ensemble is None and not os.path.exists(ENSEMBLE_PATH):
-        raise HTTPException(status_code=400, detail="Modelo no entrenado. Llama primero /train")
+async def predict(request: PredictionRequest):
+    global model
+    
+    start_execution = time.time()
+    print(f"Received prediction request with {len(request.discharges)} discharges")
+    if model is None:
+        raise HTTPException(
+            status_code=400,
+            detail=ErrorResponse(
+                error="Model not trained",
+                code="MODEL_NOT_FOUND",
+                details={"message": "Please train the model first"}
+            ).model_dump()
+        )
+    
+    try:
+        discharges = []
+        for discharge in request.discharges:
+            signals = []
+            for signal in discharge.signals:
+                signals.append(
+                    InternalSignal(
+                        label=signal.fileName,
+                        times=signal.times if signal.times else discharge.times,
+                        values=signal.values,
+                        signal_type=get_signal_type(get_sensor_id(signal)),
+                    ))
+        
+            discharges.append(
+                InternalDischarge(
+                    signals=signals, 
+                )
+            )
 
-    # Lazy load
-    global ensemble
-    if ensemble is None:
-        cnn = DilatedCNN().to(DEVICE)
-        lstm = BiLSTMAttn().to(DEVICE)
-        trf = TimeSeriesTransformer().to(DEVICE)
-        ensemble = Ensemble(cnn, lstm, trf).to(DEVICE)
-        ensemble.load_state_dict(torch.load(ENSEMBLE_PATH, map_location=DEVICE))
-        ensemble.eval()
+        # Generate windowed data
+        windowed_discharges = []
+        for discharge in discharges:
+            windowed_discharges.extend(
+                discharge.generate_windows(
+                    window_size=WINDOW_SIZE, step=1, overlap=OVERLAP
+                )
+            )
+        discharges = windowed_discharges
 
-    tic = time.time()
-    scaler_map = build_scalers(req.discharges)
-    X, _ = prepare_windows(req.discharges, scaler_map)
-    with torch.no_grad():
-        preds = torch.sigmoid(ensemble(torch.from_numpy(X).to(DEVICE))).cpu().numpy()
-    mean_score = preds.mean()
+        X_pred, _ = get_X_y(discharges)
+        X_pred = np.array([np.array(signal).T for signal in X_pred])
 
-    toc = (time.time() - tic) * 1000
-    return PredictionResponse(
-        prediction=int(mean_score > 0.5),
-        confidence=float(mean_score if mean_score > 0.5 else 1 - mean_score),
-        executionTimeMs=toc,
-        model="ensemble",
-        details={"windows": len(preds)}
-    )
+        # Make predictions
+        predictions = model.predict(X_pred, batch_size=2)
+        probs = np.where(predictions > 0.5, 1, 0).flatten()
+        print(f"Predictions: {predictions}")
 
-import psutil
+        confidence = np.mean(predictions)
+        print(f"Confidence: {confidence}")
+        
+        execution_time = (time.time() - start_execution) * 1000  # ms
+        return PredictionResponse(
+            prediction=int(predictions[0]),
+            confidence=float(confidence),
+            executionTimeMs=execution_time,
+            model="lstm",
+            details={
+                "individualPredictions": predictions.tolist(),
+                "individualConfidences": confidence.tolist(),
+                "numDischargesProcessed": len(request.discharges),
+                "featureImportance": 0
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Prediction error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=ErrorResponse(
+                error="Prediction failed",
+                code="PREDICTION_ERROR",
+                details={"message": str(e)}
+            ).model_dump()
+        )
 
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_api():
@@ -383,6 +353,17 @@ async def health_api():
     )
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=True,
-                limit_concurrency=50, limit_max_requests=20_000, timeout_keep_alive=120)
+    # Try to load the model
+    if os.path.exists(MODEL_PATH):
+        try:
+            model = pickle.load(open(MODEL_PATH, "rb"))
+            logger.info("Existing model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading model: {str(e)}")
+            model = None
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=False, 
+                limit_concurrency=50, 
+                limit_max_requests=20000,
+                timeout_keep_alive=120)
+
