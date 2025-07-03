@@ -6,8 +6,8 @@ import logging
 from typing import List, Dict, Any, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from pydantic import BaseModel, Field
 from sklearn.preprocessing import StandardScaler
 
 import torch
@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.nn import functional as F
+import requests
 
 LOGGER_FMT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOGGER_FMT)
@@ -34,10 +35,13 @@ STRIDE = 512         # 75 % overlap
 PATTERN = r"DES_(\d+)_(\d+)"
 
 class Signal(BaseModel):
-    fileName: str
+    fileName: str = Field(..., alias="filename")
     values: List[float]
     times: Optional[List[float]] = None
     length: Optional[int] = None
+
+    class Config:
+        allow_population_by_field_name = True
 
 class Discharge(BaseModel):
     id: str
@@ -46,49 +50,48 @@ class Discharge(BaseModel):
     anomalyTime: Optional[float] = None
     signals: List[Signal]
 
-class PredictionRequest(BaseModel):
-    discharges: List[Discharge]
+    class Config:
+        allow_population_by_field_name = True
 
 class PredictionResponse(BaseModel):
-    prediction: int
+    prediction: str
     confidence: float
     executionTimeMs: float
     model: str
-    details: Optional[Dict[str, Any]] = None
 
 class TrainingOptions(BaseModel):
     epochs: Optional[int] = 10
     batchSize: Optional[int] = 128
-    modelType: Optional[str] = "ensemble"  # cnn | lstm | transformer | ensemble
+    modelType: Optional[str] = "ensemble"
     learningRate: Optional[float] = 1e-3
 
-class TrainingRequest(BaseModel):
-    discharges: List[Discharge]
-    options: Optional[TrainingOptions] = None
+class StartTrainingRequest(BaseModel):
+    totalDischarges: int
+    timeoutSeconds: int
+
+class StartTrainingResponse(BaseModel):
+    expectedDischarges: int
+
+class DischargeAck(BaseModel):
+    ordinal: int
+    totalDischarges: int
 
 class TrainingMetrics(BaseModel):
-    accuracy: Optional[float] = None
-    loss: Optional[float] = None
-    f1Score: Optional[float] = None
+    accuracy: float
+    loss: float
+    f1Score: float
 
 class TrainingResponse(BaseModel):
     status: str
-    message: Optional[str] = None
-    trainingId: Optional[str] = None
-    metrics: Optional[TrainingMetrics] = None
+    message: str
+    trainingId: str
+    metrics: TrainingMetrics
     executionTimeMs: float
 
-class MemoryInfo(BaseModel):
-    total: float
-    used: float
-
 class HealthCheckResponse(BaseModel):
-    status: str
-    version: str
+    name: str
     uptime: float
-    memory: MemoryInfo
-    load: float
-    lastTraining: Optional[str] = None
+    lastTraining: str
 
 def get_sensor_id(signal: Signal) -> str:
     """Extrae id de sensor usando el patrón DES_x_y."""
@@ -224,6 +227,79 @@ class FocalLoss(nn.Module):
         return loss.sum()
 
 
+def train_model(discharges: List[Discharge], options: Optional[TrainingOptions] = None) -> TrainingResponse:
+    """Train models using provided discharges."""
+    global ensemble, last_training_time
+    tic = time.time()
+
+    opts = options or TrainingOptions()
+    scaler_map = build_scalers(discharges)
+    X, y = prepare_windows(discharges, scaler_map)
+
+    dataset = WindowDataset(X, y)
+    class_counts = np.bincount(y.astype(int))
+    class_weights = 1.0 / torch.tensor(class_counts, dtype=torch.float)
+    weights = class_weights[y.astype(int)]
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    loader = DataLoader(dataset, batch_size=opts.batchSize, sampler=sampler, pin_memory=True)
+
+    if opts.modelType in ("cnn", "ensemble"):
+        cnn = train_single(DilatedCNN(), loader, opts.epochs, opts.learningRate)
+    if opts.modelType in ("lstm", "ensemble"):
+        lstm = train_single(BiLSTMAttn(), loader, opts.epochs, opts.learningRate)
+    if opts.modelType in ("transformer", "ensemble"):
+        trf = train_single(TimeSeriesTransformer(), loader, opts.epochs, opts.learningRate)
+
+    if opts.modelType == "ensemble":
+        ensemble = Ensemble(cnn, lstm, trf).to(DEVICE)
+        for p in ensemble.cnn.parameters():
+            p.requires_grad = False
+        for p in ensemble.lstm.parameters():
+            p.requires_grad = False
+        for p in ensemble.trf.parameters():
+            p.requires_grad = False
+        ensemble.train()
+        opt_ens = optim.Adam([ensemble.weights], lr=1e-2)
+        for _ in range(20):
+            for Xb, yb in loader:
+                Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
+                opt_ens.zero_grad()
+                preds = ensemble(Xb)
+                loss = F.binary_cross_entropy(preds, yb)
+                loss.backward()
+                opt_ens.step()
+        torch.save(ensemble.state_dict(), ENSEMBLE_PATH)
+        model_name = "ensemble"
+    else:
+        path = os.path.join(MODEL_DIR, f"{opts.modelType}.pt")
+        torch.save(eval(opts.modelType).state_dict(), path)
+        model_name = opts.modelType
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    last_training_time = datetime.datetime.utcnow().isoformat()
+    toc = (time.time() - tic) * 1000
+
+    metrics = TrainingMetrics(accuracy=0.0, loss=0.0, f1Score=0.0)
+    return TrainingResponse(
+        status="SUCCESS",
+        message=f"Modelo {model_name} entrenado correctamente",
+        trainingId=f"train_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
+        metrics=metrics,
+        executionTimeMs=toc,
+    )
+
+
+def run_training(discharges: List[Discharge]):
+    """Background task to run training and notify callback if set."""
+    resp = train_model(discharges)
+    callback = os.getenv("TRAINING_CALLBACK_URL")
+    if callback:
+        try:
+            requests.post(callback, json=resp.dict())
+        except Exception as exc:
+            logger.error(f"Training callback failed: {exc}")
+
+
 def train_single(model: nn.Module, dataloader: DataLoader, epochs: int, lr: float):
     model.to(DEVICE)
     criterion = FocalLoss()
@@ -269,80 +345,40 @@ app = FastAPI(title="Disruption Classifier", version="2.0.0")
 start_time = time.time()
 last_training_time = None
 ensemble: Optional[Ensemble] = None
+training_session: Optional[dict] = None
 
-@app.post("/train", response_model=TrainingResponse)
-async def train_api(req: TrainingRequest):
-    global ensemble, last_training_time
-    tic = time.time()
+@app.post("/train", response_model=StartTrainingResponse)
+async def start_training_api(req: StartTrainingRequest):
+    global training_session
+    if training_session is not None:
+        raise HTTPException(status_code=503, detail="training in progress")
+    training_session = {"total": req.totalDischarges, "discharges": []}
+    return StartTrainingResponse(expectedDischarges=req.totalDischarges)
 
-    opts = req.options or TrainingOptions()
-    scaler_map = build_scalers(req.discharges)
-    X, y = prepare_windows(req.discharges, scaler_map)
 
-    # Dataset & sampler para mitigar desbalance
-    dataset = WindowDataset(X, y)
-    class_counts = np.bincount(y.astype(int))
-    class_weights = 1.0 / torch.tensor(class_counts, dtype=torch.float)
-    weights = class_weights[y.astype(int)]
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+@app.post("/train/{ordinal}", response_model=DischargeAck)
+async def push_discharge_api(ordinal: int, discharge: Discharge, background_tasks: BackgroundTasks):
+    global training_session
+    if training_session is None:
+        raise HTTPException(status_code=503, detail="no active training session")
+    if ordinal != len(training_session["discharges"]) + 1 or ordinal < 1 or ordinal > training_session["total"]:
+        raise HTTPException(status_code=400, detail="invalid ordinal")
+    training_session["discharges"].append(discharge)
+    total = training_session["total"]
+    if ordinal == total:
+        discharges = training_session["discharges"]
+        training_session = None
+        background_tasks.add_task(run_training, discharges)
+    return DischargeAck(ordinal=ordinal, totalDischarges=total)
 
-    loader = DataLoader(dataset, batch_size=opts.batchSize, sampler=sampler, pin_memory=True)
-
-    logger.info(f"Dataset ventanas: {len(dataset)}; anomaly ratio: {class_counts[1]/len(y):.3f}")
-
-    if opts.modelType in ("cnn", "ensemble"):
-        cnn = train_single(DilatedCNN(), loader, opts.epochs, opts.learningRate)
-    if opts.modelType in ("lstm", "ensemble"):
-        lstm = train_single(BiLSTMAttn(), loader, opts.epochs, opts.learningRate)
-    if opts.modelType in ("transformer", "ensemble"):
-        trf = train_single(TimeSeriesTransformer(), loader, opts.epochs, opts.learningRate)
-
-    if opts.modelType == "ensemble":
-        ensemble = Ensemble(cnn, lstm, trf).to(DEVICE)
-        # Freeze individual models
-        for p in ensemble.cnn.parameters(): p.requires_grad = False
-        for p in ensemble.lstm.parameters(): p.requires_grad = False
-        for p in ensemble.trf.parameters(): p.requires_grad = False
-        # Fine‑tune only weights
-        ensemble.train()
-        opt_ens = optim.Adam([ensemble.weights], lr=1e-2)
-        for _ in range(20):
-            total = 0.0
-            for Xb, yb in loader:
-                Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
-                opt_ens.zero_grad()
-                preds = ensemble(Xb)
-                loss = F.binary_cross_entropy(preds, yb)
-                loss.backward()
-                opt_ens.step()
-                total += loss.item() * Xb.size(0)
-        torch.save(ensemble.state_dict(), ENSEMBLE_PATH)
-        model_name = "ensemble"
-    else:
-        # Save single model
-        path = os.path.join(MODEL_DIR, f"{opts.modelType}.pt")
-        torch.save(eval(opts.modelType).state_dict(), path)
-        model_name = opts.modelType
-
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    last_training_time = datetime.datetime.utcnow().isoformat()
-
-    toc = (time.time() - tic) * 1000
-    return TrainingResponse(
-        status="success",
-        message=f"Modelo {model_name} entrenado correctamente",
-        trainingId=f"train_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
-        metrics=TrainingMetrics(),  # Métricas reales se pueden añadir vía MLflow / callback.
-        executionTimeMs=toc,
-    )
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict_api(req: PredictionRequest):
+async def predict_api(discharge: Discharge):
+    global ensemble
     if ensemble is None and not os.path.exists(ENSEMBLE_PATH):
         raise HTTPException(status_code=400, detail="Modelo no entrenado. Llama primero /train")
 
     # Lazy load
-    global ensemble
     if ensemble is None:
         cnn = DilatedCNN().to(DEVICE)
         lstm = BiLSTMAttn().to(DEVICE)
@@ -352,33 +388,26 @@ async def predict_api(req: PredictionRequest):
         ensemble.eval()
 
     tic = time.time()
-    scaler_map = build_scalers(req.discharges)
-    X, _ = prepare_windows(req.discharges, scaler_map)
+    scaler_map = build_scalers([discharge])
+    X, _ = prepare_windows([discharge], scaler_map)
     with torch.no_grad():
         preds = torch.sigmoid(ensemble(torch.from_numpy(X).to(DEVICE))).cpu().numpy()
     mean_score = preds.mean()
 
     toc = (time.time() - tic) * 1000
     return PredictionResponse(
-        prediction=int(mean_score > 0.5),
+        prediction="Anomaly" if mean_score > 0.5 else "Normal",
         confidence=float(mean_score if mean_score > 0.5 else 1 - mean_score),
         executionTimeMs=toc,
         model="ensemble",
-        details={"windows": len(preds)}
     )
-
-import psutil
 
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_api():
-    mem = psutil.virtual_memory()
     return HealthCheckResponse(
-        status="online" if os.path.exists(ENSEMBLE_PATH) else "degraded",
-        version="2.0.0",
+        name="lstm",
         uptime=time.time() - start_time,
-        memory=MemoryInfo(total=mem.total / 1_048_576, used=mem.used / 1_048_576),
-        load=psutil.cpu_percent() / 100,
-        lastTraining=last_training_time,
+        lastTraining=last_training_time or "",
     )
 
 if __name__ == "__main__":
