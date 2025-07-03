@@ -36,7 +36,7 @@ STRIDE = 512         # 75 % overlap
 PATTERN = r"DES_(\d+)_(\d+)"
 
 class Signal(BaseModel):
-    fileName: str
+    filename: str
     values: List[float]
     times: Optional[List[float]] = None
     length: Optional[int] = None
@@ -59,15 +59,11 @@ class DischargeAck(BaseModel):
     ordinal: int
     totalDischarges: int
 
-class PredictionRequest(BaseModel):
-    discharge: Discharge
-
 class PredictionResponse(BaseModel):
-    prediction: int
+    prediction: str  # "Normal" or "Anomaly"
     confidence: float
     executionTimeMs: float
     model: str
-    details: Optional[Dict[str, Any]] = None
 
 class TrainingOptions(BaseModel):
     epochs: Optional[int] = 10
@@ -98,9 +94,9 @@ class HealthCheckResponse(BaseModel):
 
 def get_sensor_id(signal: Signal) -> str:
     """Extrae id de sensor usando el patrón DES_x_y."""
-    match = re.match(PATTERN, signal.fileName)
+    match = re.match(PATTERN, signal.filename)
     if not match:
-        raise ValueError(f"Nombre de fichero no válido: {signal.fileName}")
+        raise ValueError(f"Nombre de fichero no válido: {signal.filename}")
     return match.group(2)
 
 
@@ -409,7 +405,7 @@ async def push_discharge(ordinal: int, discharge: Discharge, background_tasks: B
 
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict_api(req: PredictionRequest):
+async def predict_api(discharge: Discharge):
     global ensemble, autoencoder, tau_value
     if all([ensemble is None, autoencoder is None]) and not any([os.path.exists(ENSEMBLE_PATH), os.path.exists(AE_PATH)]):
         raise HTTPException(status_code=400, detail="Modelo no entrenado. Llama primero /train")
@@ -430,8 +426,8 @@ async def predict_api(req: PredictionRequest):
             tau_value = float(np.load(THRESHOLD_PATH))
 
     tic = time.time()
-    scaler_map = build_scalers([req.discharge])
-    X, _ = prepare_windows([req.discharge], scaler_map)
+    scaler_map = build_scalers([discharge])
+    X, _ = prepare_windows([discharge], scaler_map)
     with torch.no_grad():
         if autoencoder is not None:
             tens = torch.from_numpy(X).to(DEVICE)
@@ -452,11 +448,10 @@ async def predict_api(req: PredictionRequest):
 
     toc = (time.time() - tic) * 1000
     return PredictionResponse(
-        prediction=int(is_anomaly),
+        prediction="Anomaly" if is_anomaly else "Normal",
         confidence=confidence,
         executionTimeMs=toc,
         model=model_name,
-        details={"windows": len(X)}
     )
 
 @app.get("/health", response_model=HealthCheckResponse)

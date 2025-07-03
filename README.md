@@ -1,4 +1,6 @@
 # py_lstm
-LSTM based models for disruption detection. Includes a supervised ensemble classifier
-and an unsupervised autoencoder for anomaly detection. The API now follows the
-Node Protocol with `/train` and `/train/{ordinal}` endpoints to stream discharges.
+LSTM based models for disruption detection. This repository provides both a
+supervised ensemble classifier and an unsupervised autoencoder for anomaly
+detection. The HTTP API implements the Node Protocol with a `/train` handshake
+followed by `/train/{ordinal}` uploads and a `/predict` endpoint for single
+discharge predictions.
