@@ -1,2 +1,2 @@
 # py_lstm
-LSTM model for the outlier Classifier
+LSTM based models for disruption detection. Includes a supervised ensemble classifier and an unsupervised autoencoder for anomaly detection.
