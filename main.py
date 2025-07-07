@@ -219,7 +219,7 @@ class LSTMAutoencoder(nn.Module):
 
     def forward(self, x):
         _, (h, c) = self.encoder(x)
-        dec_in = torch.zeros_like(x[:, :, :self.encoder.hidden_size])
+        dec_in = torch.zeros(x.size(0), x.size(1), self.encoder.hidden_size, device=x.device)
         out, _ = self.decoder(dec_in, (h, c))
         return self.output(out)
 
