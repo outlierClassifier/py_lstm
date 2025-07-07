@@ -329,6 +329,9 @@ def run_training_job(discharges: List[Discharge], opts: TrainingOptions = Traini
     """Internal training logic."""
     global ensemble, autoencoder, tau_value, last_training_time
     tic = time.time()
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    
     scaler_map = build_scalers(discharges)
     X, y = prepare_windows(discharges, scaler_map)
 
@@ -373,7 +376,6 @@ def run_training_job(discharges: List[Discharge], opts: TrainingOptions = Traini
                     opt_ens.step()
             torch.save(ensemble.state_dict(), ENSEMBLE_PATH)
 
-    os.makedirs(MODEL_DIR, exist_ok=True)
     last_training_time = datetime.datetime.utcnow().isoformat()
     logger.info(f"Training completed in {(time.time() - tic) * 1000:.2f} ms")
 
