@@ -211,11 +211,11 @@ class TimeSeriesTransformer(nn.Module):
         return self.cls(x).squeeze(-1)
 
 class LSTMAutoencoder(nn.Module):
-    def __init__(self, hidden=128):
+    def __init__(self, input_size=7, hidden=128):
         super().__init__()
-        self.encoder = nn.LSTM(7, hidden, num_layers=2, batch_first=True)
+        self.encoder = nn.LSTM(input_size, hidden, num_layers=2, batch_first=True)
         self.decoder = nn.LSTM(hidden, hidden, num_layers=2, batch_first=True)
-        self.output = nn.Linear(hidden, 7)
+        self.output = nn.Linear(hidden, input_size)
 
     def forward(self, x):
         _, (h, c) = self.encoder(x)
@@ -339,7 +339,8 @@ def run_training_job(discharges: List[Discharge], opts: TrainingOptions = Traini
         normal_idx = np.where(y == 0)[0]
         dataset = WindowDataset(X[normal_idx], y[normal_idx])
         loader = DataLoader(dataset, batch_size=opts.batchSize, shuffle=True, pin_memory=True)
-        autoencoder = train_autoencoder(LSTMAutoencoder(), loader, opts.epochs, opts.learningRate)
+        input_size = X.shape[2]
+        autoencoder = train_autoencoder(LSTMAutoencoder(input_size=input_size), loader, opts.epochs, opts.learningRate)
         torch.save(autoencoder.state_dict(), AE_PATH)
         calib_loader = DataLoader(WindowDataset(X, y), batch_size=opts.batchSize, shuffle=False)
         tau_value = compute_threshold(autoencoder, calib_loader)
