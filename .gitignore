@@ -1,6 +1,11 @@
 # Project-specific files
-*.h5
+*.keras
 *.pkl
+*.txt
+*.h5
+*.txt
+*.keras
+*.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
