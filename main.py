@@ -30,8 +30,11 @@ FORECASTER_PATH = os.path.join(MODEL_DIR, "forecaster.pt")
 THRESHOLD_PATH = os.path.join(MODEL_DIR, "tau.npy")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-WINDOW_SIZE = 16  # Number of time steps per window
-STRIDE = 0        # Overlap disabled
+WINDOW_SIZE = 16          # Number of time steps per window
+STRIDE = 0                # Overlap disabled
+FORECAST_H = 4            # Number of steps to forecast
+WARMUP_WINDOWS = 6        # Number of initial windows to ignore
+WINDOW_ANOM_FACTOR = 1.5  # Factor to consider a window as anomalous
 
 MODEL_NAME = "LSTM"
 PATTERN = r"DES_(\d+)_(\d+)"
@@ -116,25 +119,27 @@ class SeqDataset(Dataset):
     def __getitem__(self, idx): return self.seqs[idx]
 
 def pad_collate_forecast(batch):
-    # batch: array list (T_i, D). Contructs X=(T_i-1), Y=(T_i-1) with next-step.
+    # batch: lista de arrays (T_i, D) normalizados
     Ds = [torch.from_numpy(b) for b in batch]
     lens = [d.size(0) for d in Ds]
-    # drop sequences of length 1 (no next-step)
-    keep = [i for i, L in enumerate(lens) if L >= 2]
+    keep = [i for i, L in enumerate(lens) if L > FORECAST_H]  # T_i > H
     Ds = [Ds[i] for i in keep]; lens = [lens[i] for i in keep]
-    Tm1 = max(L-1 for L in lens)
+    if not Ds:
+        return torch.zeros(0,1,1), torch.zeros(0,1,1), torch.zeros(0, dtype=torch.long)
+
+    TmH = max(L-FORECAST_H for L in lens)
     D = Ds[0].size(1)
-    X = torch.zeros(len(Ds), Tm1, D)
-    Y = torch.zeros(len(Ds), Tm1, D)
-    Lm1 = torch.zeros(len(Ds), dtype=torch.long)
+    X = torch.zeros(len(Ds), TmH, D)
+    Y = torch.zeros(len(Ds), TmH, D)
+    LmH = torch.zeros(len(Ds), dtype=torch.long)
     for i, d in enumerate(Ds):
         L = d.size(0)
-        x = d[:L-1, :]
-        y = d[1:L, :]
-        X[i, :L-1] = x
-        Y[i, :L-1] = y
-        Lm1[i] = L-1
-    return X, Y, Lm1
+        x = d[:L-FORECAST_H, :]
+        y = d[FORECAST_H:, :]
+        X[i, :L-FORECAST_H] = x
+        Y[i, :L-FORECAST_H] = y
+        LmH[i] = L-FORECAST_H
+    return X, Y, LmH
 
 def get_sensor_id(signal: Signal) -> str:
     """Extracts sensor ID using the pattern DES_x_y."""
@@ -484,21 +489,36 @@ def run_training_job(discharges: List[Discharge]):
     """Internal training logic."""
     global g_model, tau_value, last_training_time
     tic = time.time()
-    os.makedirs(MODEL_DIR, exist_ok=True)
 
     sequences, stats = prepare_feature_sequences(discharges)
 
+    mu0 = np.array(stats["mean"], dtype=np.float32)
+    sd0 = np.array(stats["std"],  dtype=np.float32)
+    sequences_raw = [ (seq * sd0 + mu0).astype(np.float32) for seq in sequences ]
+    sequences_raw = [ (seq[WARMUP_WINDOWS:] if seq.shape[0] > WARMUP_WINDOWS+1 else seq)
+                      for seq in sequences_raw ]
+
     # Train only with non-disruptive discharges
-    pairs = [(seq, d.id) for seq, d in zip(sequences, discharges) if d.anomalyTime is None]
+    pairs = [(seq, d.id) for seq, d in zip(sequences_raw, discharges) if d.anomalyTime is None]
     if not pairs:
         raise RuntimeError("No non-disruptive discharges to train the forecaster.")
 
     rng = np.random.RandomState(SEED)
-    idx = np.arange(len(pairs))
-    rng.shuffle(idx)
+    idx = np.arange(len(pairs)); rng.shuffle(idx)
     cut = int(0.8 * len(idx))
-    train_pairs = [pairs[i][0] for i in idx[:cut]]
-    val_pairs   = [pairs[i][0] for i in idx[cut:]]
+    train_raw = [pairs[i][0] for i in idx[:cut]]
+    val_raw   = [pairs[i][0] for i in idx[cut:]]
+
+    train_stack = np.vstack(train_raw).astype(np.float64, copy=False)
+    mu1 = train_stack.mean(axis=0).astype(np.float32)
+    sd1 = (train_stack.std(axis=0) + 1e-6).astype(np.float32)
+
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    with open(os.path.join(MODEL_DIR, "feat_stats.json"), "w") as f:
+        import json; json.dump({"mean": mu1.tolist(), "std": sd1.tolist()}, f)
+
+    train_pairs = [ ((seq - mu1) / sd1).astype(np.float32) for seq in train_raw ]
+    val_pairs   = [ ((seq - mu1) / sd1).astype(np.float32) for seq in val_raw ]
 
     # DataLoaders
     ds_tr = SeqDataset(train_pairs)
@@ -643,6 +663,14 @@ async def predict_api(discharge: Discharge):
     mu = np.array(st["mean"], dtype=np.float32); sd = np.array(st["std"], dtype=np.float32)
     seq = ((np.stack(feats).astype(np.float32) - mu) / sd).astype(np.float32)  # (Nw, D)
 
+    if seq.shape[0] <= FORECAST_H:
+        raise HTTPException(status_code=400, detail="Sequence too short for forecasting.")
+
+    x = torch.from_numpy(seq[:-FORECAST_H]).unsqueeze(0).to(DEVICE)
+    y = torch.from_numpy(seq[FORECAST_H:]).unsqueeze(0).to(DEVICE)
+    yhat = g_model(x)
+    err = F.smooth_l1_loss(yhat, y, reduction='none').mean(dim=2).squeeze(0).cpu().numpy()
+
     if g_model is None and os.path.exists(FORECASTER_PATH):
         g_model = LSTMForecaster(input_size=seq.shape[1], hidden=192, num_layers=1).to(DEVICE)
         g_model.load_state_dict(torch.load(FORECASTER_PATH, map_location=DEVICE))
@@ -658,24 +686,31 @@ async def predict_api(discharge: Discharge):
     with torch.no_grad():
         if seq.shape[0] < 2:
             raise HTTPException(status_code=400, detail="Sequence too short for prediction")
-        x = torch.from_numpy(seq[:-1]).unsqueeze(0).to(DEVICE)  # (1, T-1, D)
+        x = torch.from_numpy(seq[:-1]).unsqueeze(0).to(DEVICE)
         y = torch.from_numpy(seq[1:]).unsqueeze(0).to(DEVICE)
         yhat = g_model(x)
-        err = F.smooth_l1_loss(yhat, y, reduction='none').mean(dim=2).squeeze(0).cpu().numpy()
+        err = F.smooth_l1_loss(yhat, y, reduction='none').mean(dim=2).squeeze(0).cpu().numpy()  # (T-1,)
+
+    if err.shape[0] >= WARMUP_WINDOWS:
+        err[:WARMUP_WINDOWS] = 0.0
 
     shot_p95 = float(np.percentile(err, 95))
-    is_anom = shot_p95 >= tau_value
-    ratio = shot_p95 / (tau_value + 1e-8)
-    conf  = float(np.clip(ratio if is_anom else 1.0 - ratio, 0.0, 1.0))
-    err_aligned = np.concatenate([err, err[-1:]], axis=0)
-    probs = np.clip(err_aligned / (tau_value + 1e-8), 0.0, 1.0)
+    is_anom  = (shot_p95 >= tau_value)
+    ratio    = shot_p95 / (tau_value + 1e-8)
+    conf     = float(np.clip(ratio if is_anom else 1.0 - ratio, 0.0, 1.0))
+
+    # alinear a Nw ventanas
+    err_aligned = np.concatenate([err, np.repeat(err[-1], FORECAST_H)], axis=0)  # mismo largo que ventanas
+    ratio_win   = err_aligned / (tau_value + 1e-8)
+    probs       = np.clip(ratio_win, 0.0, 1.0)
 
     windows = [
         WindowProperties(
             featureValues=seq[i].tolist(),
-            prediction=("Anomaly" if probs[i] >= 1.0 else "Normal"),
+            prediction=("Anomaly" if ratio_win[i] >= WINDOW_ANOM_FACTOR else "Normal"),
             justification=float(probs[i])
-        ) for i in range(len(probs))
+        )
+        for i in range(len(probs))
     ]
 
     exec_ms = (time.time() - tic) * 1000.0
