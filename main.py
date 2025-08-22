@@ -6,15 +6,15 @@ import logging
 from typing import List, Dict, Any, Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from pydantic import BaseModel, Field, field_validator
 from sklearn.preprocessing import StandardScaler
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.nn import functional as F
 
 LOGGER_FMT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOGGER_FMT)
@@ -26,76 +26,190 @@ torch.manual_seed(SEED)
 
 MODEL_DIR = "artifacts"
 ENSEMBLE_PATH = os.path.join(MODEL_DIR, "ensemble.pt")
+FORECASTER_PATH = os.path.join(MODEL_DIR, "forecaster.pt")
+THRESHOLD_PATH = os.path.join(MODEL_DIR, "tau.npy")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-WINDOW = 2_048       # Number of time steps per window
-STRIDE = 512         # 75 % overlap
+WINDOW_SIZE = 16          # Number of time steps per window
+STRIDE = 0                # Overlap disabled
+FORECAST_H = 4            # Number of steps to forecast
+WARMUP_WINDOWS = 6        # Number of initial windows to ignore
+WINDOW_ANOM_FACTOR = 1.5  # Factor to consider a window as anomalous
 
+MODEL_NAME = "LSTM"
 PATTERN = r"DES_(\d+)_(\d+)"
 
+A_MINOR = 0.95  # [m] Minor radius for Greenwald limit on JET
+EPOCHS_DEFAULT = 30
+LEARNING_RATE_DEFAULT = 1e-3
+
+EPS = 1e-12    # avoid division by zero
+
+# ratios caps to avoid explosions before log
+CAP_RAD_FRAC      = 1e6       # P_rad / P_in
+CAP_GREENWALD_FR  = 10.0      # n_e / n_G (physically ~O(1), but we leave some margin)
+CAP_BETA_LOSS     = 1e6       # |dW/dt| / P_in
+CAP_LM_NORM       = 1e6       # |LM| / I_p
+CAP_LI_NORM       = 1e6       # l_i / I_p
+CAP_LOG_FEATURE   = 50.0   
+
 class Signal(BaseModel):
-    fileName: str
+    filename: str
     values: List[float]
-    times: Optional[List[float]] = None
-    length: Optional[int] = None
 
 class Discharge(BaseModel):
     id: str
-    times: Optional[List[float]] = None
-    length: Optional[int] = None
-    anomalyTime: Optional[float] = None
     signals: List[Signal]
+    times: List[float]
+    length: int
+    anomalyTime: Optional[float] = None
 
-class PredictionRequest(BaseModel):
-    discharges: List[Discharge]
+    @field_validator("signals", mode="before")
+    @classmethod
+    def _ensure_list(cls, v: Any) -> List[Signal] | Any:
+        if isinstance(v, dict):
+            return [v]
+        return v
 
-class PredictionResponse(BaseModel):
-    prediction: int
-    confidence: float
-    executionTimeMs: float
-    model: str
-    details: Optional[Dict[str, Any]] = None
+class StartTrainingRequest(BaseModel):
+    totalDischarges: int = Field(..., ge=1)
+    timeoutSeconds: int = Field(..., ge=1)
 
-class TrainingOptions(BaseModel):
-    epochs: Optional[int] = 10
-    batchSize: Optional[int] = 128
-    modelType: Optional[str] = "ensemble"  # cnn | lstm | transformer | ensemble
-    learningRate: Optional[float] = 1e-3
+class StartTrainingResponse(BaseModel):
+    expectedDischarges: int
 
-class TrainingRequest(BaseModel):
-    discharges: List[Discharge]
-    options: Optional[TrainingOptions] = None
+class DischargeAck(BaseModel):
+    ordinal: int
+    totalDischarges: int
 
 class TrainingMetrics(BaseModel):
-    accuracy: Optional[float] = None
-    loss: Optional[float] = None
-    f1Score: Optional[float] = None
+    accuracy: float
+    loss: float
+    f1Score: float
 
 class TrainingResponse(BaseModel):
     status: str
-    message: Optional[str] = None
-    trainingId: Optional[str] = None
-    metrics: Optional[TrainingMetrics] = None
+    message: str
+    trainingId: str
+    metrics: TrainingMetrics
     executionTimeMs: float
 
-class MemoryInfo(BaseModel):
-    total: float
-    used: float
+class WindowProperties(BaseModel):
+    featureValues: List[float] = Field(..., min_items=1)
+    prediction: str = Field(..., pattern=r'^(Anomaly|Normal)$')
+    justification: float
+
+class PredictionResponse(BaseModel):
+    prediction: str
+    confidence: float
+    executionTimeMs: float
+    model: str
+    windowSize: int = WINDOW_SIZE
+    windows: List[WindowProperties]
 
 class HealthCheckResponse(BaseModel):
-    status: str
-    version: str
+    name: str = MODEL_NAME
     uptime: float
-    memory: MemoryInfo
-    load: float
-    lastTraining: Optional[str] = None
+    lastTraining: str
+
+class SeqDataset(Dataset):
+    def __init__(self, sequences: list[np.ndarray]):
+        self.seqs = sequences
+    def __len__(self): return len(self.seqs)
+    def __getitem__(self, idx): return self.seqs[idx]
+
+def pad_collate_forecast(batch):
+    # batch: lista de arrays (T_i, D) normalizados
+    Ds = [torch.from_numpy(b) for b in batch]
+    lens = [d.size(0) for d in Ds]
+    keep = [i for i, L in enumerate(lens) if L > FORECAST_H]  # T_i > H
+    Ds = [Ds[i] for i in keep]; lens = [lens[i] for i in keep]
+    if not Ds:
+        return torch.zeros(0,1,1), torch.zeros(0,1,1), torch.zeros(0, dtype=torch.long)
+
+    TmH = max(L-FORECAST_H for L in lens)
+    D = Ds[0].size(1)
+    X = torch.zeros(len(Ds), TmH, D)
+    Y = torch.zeros(len(Ds), TmH, D)
+    LmH = torch.zeros(len(Ds), dtype=torch.long)
+    for i, d in enumerate(Ds):
+        L = d.size(0)
+        x = d[:L-FORECAST_H, :]
+        y = d[FORECAST_H:, :]
+        X[i, :L-FORECAST_H] = x
+        Y[i, :L-FORECAST_H] = y
+        LmH[i] = L-FORECAST_H
+    return X, Y, LmH
 
 def get_sensor_id(signal: Signal) -> str:
-    """Extrae id de sensor usando el patrón DES_x_y."""
-    match = re.match(PATTERN, signal.fileName)
+    """Extracts sensor ID using the pattern DES_x_y."""
+    match = re.match(PATTERN, signal.filename)
     if not match:
-        raise ValueError(f"Nombre de fichero no válido: {signal.fileName}")
+        raise ValueError(f"Invalid filename: {signal.filename}")
     return match.group(2)
+
+def _safe_div(a, b):
+    return 0.0 if (b == 0 or not np.isfinite(a) or not np.isfinite(b)) else (a / b)
+
+def _safe_ratio(a: float, b: float, cap: float, nonneg: bool = False) -> float:
+    """Returns (a / max(|b|, EPS)) capped to ±cap (or [0, cap] if nonneg=True)."""
+    denom = max(abs(b), EPS)
+    r = a / denom
+    if nonneg:
+        r = max(0.0, r)
+        return float(min(r, cap))
+    return float(np.clip(r, -cap, cap))
+
+def extract_aux_features(win_raw: np.ndarray,
+                         prev_logs: Optional[tuple[float, float]]) -> tuple[np.ndarray, tuple[float, float]]:
+    # f64 to avoid overflow
+    wr64 = win_raw.astype(np.float64, copy=False)
+
+    mean_vals = np.mean(wr64, axis=1) 
+    Ip, LM, LI, NE, dWdt, Prad, Pin = mean_vals
+    Ip_MA   = Ip * 1e-6
+    ne_1e20 = NE * 1e-20
+
+    rad_frac  = _safe_ratio(Prad, Pin,  CAP_RAD_FRAC, nonneg=True)
+    greenwald = _safe_ratio(ne_1e20, Ip_MA/(np.pi*A_MINOR**2 + EPS), CAP_GREENWALD_FR, nonneg=True)
+    LM_norm   = _safe_ratio(abs(LM), max(Ip_MA, EPS), CAP_LM_NORM, nonneg=True)
+    li_norm   = _safe_ratio(LI,      max(Ip_MA, EPS), CAP_LI_NORM, nonneg=False)
+    beta_loss = _safe_ratio(abs(dWdt), max(Pin, EPS), CAP_BETA_LOSS, nonneg=True)
+
+    # avoid heterogeneous values in std
+    cross_std = float(np.std(np.log1p(np.abs(mean_vals) + 1e-12)))
+
+    Elog = float(np.log1p(np.mean(wr64**2)))
+
+    L_rad  = float(np.log1p(rad_frac))
+    L_gw   = float(np.log1p(greenwald))
+    L_lm   = float(np.log1p(LM_norm))
+    L_li   = float(np.log1p(abs(li_norm)))
+    L_beta = float(np.log1p(beta_loss))
+
+    if prev_logs is None:
+        d_rad=d_beta=d_gw=d_lm=d_li = 0.0
+    else:
+        prev_Lrad, prev_Lbeta, prev_Lgw, prev_Llm, prev_Lli = prev_logs
+        d_rad  = float(L_rad  - prev_Lrad)
+        d_beta = float(L_beta - prev_Lbeta)
+        d_gw   = float(L_gw   - prev_Lgw)
+        d_lm   = float(L_lm   - prev_Llm)
+        d_li   = float(L_li   - prev_Lli)
+
+    feat64 = np.array([L_rad, L_gw, L_lm, L_li, L_beta, cross_std, Elog, d_rad, d_beta, d_gw, d_lm, d_li], 
+                      dtype=np.float64)
+
+    feat64 = np.nan_to_num(feat64, posinf=CAP_LOG_FEATURE, neginf=-CAP_LOG_FEATURE)
+    feat64 = np.clip(feat64, -CAP_LOG_FEATURE, CAP_LOG_FEATURE)
+
+    return feat64.astype(np.float32), (L_rad, L_beta, L_gw, L_lm, L_li)
+
+def build_feature_scaler(feat_list: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    F = np.vstack(feat_list).astype(np.float64, copy=False)   # avoid overflow in std
+    mu = np.nanmean(F, axis=0)
+    sd = np.nanstd(F,  axis=0) + 1e-6
+    return mu.astype(np.float32), sd.astype(np.float32)
 
 
 def build_scalers(discharges: List[Discharge]):
@@ -111,28 +225,60 @@ def build_scalers(discharges: List[Discharge]):
         scalers[sid] = scaler
     return scalers
 
+def prepare_feature_sequences(discharges: List[Discharge]) -> tuple[list[np.ndarray], dict]:
+    sequences: list[np.ndarray] = []
+    all_feats: list[np.ndarray] = []
 
-def prepare_windows(discharges: List[Discharge], scalers: Dict[str, StandardScaler]):
-    X, y = [], []
+    dropped_by_shot = 0
+    kept_by_shot = 0
+
     for d in discharges:
-        # Normaliza cada señal
-        norm_signals = []
-        for s in d.signals:
-            arr = np.asarray(s.values, dtype=np.float32).reshape(-1, 1)
-            arr = scalers[get_sensor_id(s)].transform(arr).ravel()
-            # Clipping p99 para robustez
-            p99 = np.percentile(arr, 99)
-            arr = np.clip(arr, -p99, p99)
-            norm_signals.append(arr)
-        seq_len = len(norm_signals[0])
-        # Sliding windows
-        for start in range(0, seq_len - WINDOW + 1, STRIDE):
-            window = [sig[start:start+WINDOW] for sig in norm_signals]  # -> list[7][WINDOW]
-            X.append(window)
-            y.append(1 if d.anomalyTime is not None else 0)
-    X = np.transpose(np.array(X, dtype=np.float32), (0, 2, 1))  # (samples, time, features)
-    y = np.array(y, dtype=np.float32)
-    return X, y
+        raw = np.stack([np.asarray(s.values, dtype=np.float32) for s in d.signals])  # (7, T)
+        T = raw.shape[1]
+        feats = []
+        prev = None
+        local_dropped = 0
+        for start in range(0, T - WINDOW_SIZE + 1, max(1, WINDOW_SIZE)):
+            win_raw = raw[:, start:start+WINDOW_SIZE]
+            if win_raw.shape[1] < WINDOW_SIZE:
+                break
+            # raw filter
+            if not np.isfinite(win_raw).all():
+                local_dropped += 1
+                continue
+
+            f, next_prev = extract_aux_features(win_raw, prev)
+            if not np.isfinite(f).all():
+                local_dropped += 1
+                continue
+
+            feats.append(f); all_feats.append(f)
+            prev = next_prev
+
+        if len(feats) > 0:
+            sequences.append(np.stack(feats).astype(np.float32))  # (Nw, D)
+            kept_by_shot += len(feats)
+        dropped_by_shot += local_dropped
+
+    if len(all_feats) == 0:
+        raise RuntimeError("No valid feature windows after sanity filtering (NaN/Inf). Check input signals.")
+
+    # global scaler per feature (ε included at build_feature_scaler)
+    mu, sd = build_feature_scaler(all_feats)
+    stats = {"mean": mu.tolist(), "std": sd.tolist()}
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    with open(os.path.join(MODEL_DIR, "feat_stats.json"), "w") as f:
+        import json; json.dump(stats, f)
+
+    # normalize sequences
+    sequences = [((seq - mu) / sd).astype(np.float32) for seq in sequences]
+
+    try:
+        logger.info(f"Kept feature windows: {kept_by_shot}, dropped: {dropped_by_shot}")
+    except Exception:
+        pass
+    return sequences, stats
+
 
 class WindowDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray):
@@ -200,13 +346,39 @@ class TimeSeriesTransformer(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.cls = nn.Linear(d_model, 1)
-        self.pos = nn.Parameter(torch.randn(1, WINDOW, d_model))
+        self.pos = nn.Parameter(torch.randn(1, WINDOW_SIZE, d_model))
 
     def forward(self, x):
         x = self.input_proj(x) + self.pos[:, :x.size(1)]
         x = self.transformer(x)
         x = x.mean(1)
         return self.cls(x).squeeze(-1)
+
+class LSTMAutoencoder(nn.Module):
+    def __init__(self, input_size=7, hidden=128):
+        super().__init__()
+        self.encoder = nn.LSTM(input_size, hidden, num_layers=2, batch_first=True)
+        self.decoder = nn.LSTM(hidden, hidden, num_layers=2, batch_first=True)
+        self.output = nn.Linear(hidden, input_size)
+
+    def forward(self, x):
+        _, (h, c) = self.encoder(x)
+        dec_in = torch.zeros(x.size(0), x.size(1), self.encoder.hidden_size, device=x.device)
+        out, _ = self.decoder(dec_in, (h, c))
+        return self.output(out)
+
+class LSTMForecaster(nn.Module):
+    def __init__(self, input_size: int, hidden: int = 192, num_layers: int = 1, dropout: float = 0.0):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden,
+                            num_layers=num_layers, batch_first=True, dropout=dropout)
+        self.proj = nn.Linear(hidden, input_size)
+
+    def forward(self, x):
+        # x: (B, T, D) -> yhat: (B, T, D)
+        h, _ = self.lstm(x)
+        return self.proj(h)
+
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, reduction="mean"):
@@ -222,7 +394,6 @@ class FocalLoss(nn.Module):
         if self.reduction == "mean":
             return loss.mean()
         return loss.sum()
-
 
 def train_single(model: nn.Module, dataloader: DataLoader, epochs: int, lr: float):
     model.to(DEVICE)
@@ -246,6 +417,45 @@ def train_single(model: nn.Module, dataloader: DataLoader, epochs: int, lr: floa
 
     return model
 
+def train_autoencoder(model: nn.Module, dataloader: DataLoader, epochs: int, lr: float):
+    model.to(DEVICE)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    model.train()
+    for epoch in range(epochs):
+        running = 0.0
+        count = 0
+        for X, _, lengths in dataloader:          # ← ahora recibimos 3 elementos
+            X = X.to(DEVICE)
+            lengths = lengths.to(DEVICE)
+            optimizer.zero_grad()
+            recon = model(X)                      # (B, T, D)
+            err_t = F.smooth_l1_loss(recon, X, reduction='none').mean(dim=2)  # (B, T)
+            T = X.size(1)
+            mask = (torch.arange(T, device=DEVICE).unsqueeze(0) < lengths.unsqueeze(1)).float()
+            loss = (err_t * mask).sum() / mask.sum().clamp_min(1.0)
+            loss.backward()
+            optimizer.step()
+            running += loss.item()
+            count += 1
+        scheduler.step()
+        logger.info(f"Epoch {epoch+1}/{epochs} - Loss: {running / max(1,count):.6f}")
+    model.eval()
+    return model
+
+# def compute_threshold(model: nn.Module, dataloader: DataLoader, fa_rate: float = 0.005) -> float:
+#     model.eval()
+#     errors = []
+#     with torch.no_grad():
+#         for X, _ in dataloader:
+#             X = X.to(DEVICE)
+#             recon = model(X)
+#             err = ((recon - X) ** 2).mean(dim=(1, 2)).cpu().numpy()
+#             errors.extend(err)
+#     tau = float(np.percentile(errors, 100 * (1 - fa_rate)))
+#     np.save(THRESHOLD_PATH, tau)
+#     print(f"Computed threshold value: {tau}")
+#     return tau
 
 class Ensemble(nn.Module):
     def __init__(self, cnn: DilatedCNN, lstm: BiLSTMAttn, trf: TimeSeriesTransformer):
@@ -269,119 +479,260 @@ app = FastAPI(title="Disruption Classifier", version="2.0.0")
 start_time = time.time()
 last_training_time = None
 ensemble: Optional[Ensemble] = None
+g_model: Optional[LSTMForecaster] = None
+tau_value: Optional[float] = None
+expected_discharges: int = 0
+buffered_discharges: List[Discharge] = []
 
-@app.post("/train", response_model=TrainingResponse)
-async def train_api(req: TrainingRequest):
-    global ensemble, last_training_time
+
+def run_training_job(discharges: List[Discharge]):
+    """Internal training logic."""
+    global g_model, tau_value, last_training_time
     tic = time.time()
 
-    opts = req.options or TrainingOptions()
-    scaler_map = build_scalers(req.discharges)
-    X, y = prepare_windows(req.discharges, scaler_map)
+    sequences, stats = prepare_feature_sequences(discharges)
 
-    # Dataset & sampler para mitigar desbalance
-    dataset = WindowDataset(X, y)
-    class_counts = np.bincount(y.astype(int))
-    class_weights = 1.0 / torch.tensor(class_counts, dtype=torch.float)
-    weights = class_weights[y.astype(int)]
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    mu0 = np.array(stats["mean"], dtype=np.float32)
+    sd0 = np.array(stats["std"],  dtype=np.float32)
+    sequences_raw = [ (seq * sd0 + mu0).astype(np.float32) for seq in sequences ]
+    sequences_raw = [ (seq[WARMUP_WINDOWS:] if seq.shape[0] > WARMUP_WINDOWS+1 else seq)
+                      for seq in sequences_raw ]
 
-    loader = DataLoader(dataset, batch_size=opts.batchSize, sampler=sampler, pin_memory=True)
+    # Train only with non-disruptive discharges
+    pairs = [(seq, d.id) for seq, d in zip(sequences_raw, discharges) if d.anomalyTime is None]
+    if not pairs:
+        raise RuntimeError("No non-disruptive discharges to train the forecaster.")
 
-    logger.info(f"Dataset ventanas: {len(dataset)}; anomaly ratio: {class_counts[1]/len(y):.3f}")
+    rng = np.random.RandomState(SEED)
+    idx = np.arange(len(pairs)); rng.shuffle(idx)
+    cut = int(0.8 * len(idx))
+    train_raw = [pairs[i][0] for i in idx[:cut]]
+    val_raw   = [pairs[i][0] for i in idx[cut:]]
 
-    if opts.modelType in ("cnn", "ensemble"):
-        cnn = train_single(DilatedCNN(), loader, opts.epochs, opts.learningRate)
-    if opts.modelType in ("lstm", "ensemble"):
-        lstm = train_single(BiLSTMAttn(), loader, opts.epochs, opts.learningRate)
-    if opts.modelType in ("transformer", "ensemble"):
-        trf = train_single(TimeSeriesTransformer(), loader, opts.epochs, opts.learningRate)
-
-    if opts.modelType == "ensemble":
-        ensemble = Ensemble(cnn, lstm, trf).to(DEVICE)
-        # Freeze individual models
-        for p in ensemble.cnn.parameters(): p.requires_grad = False
-        for p in ensemble.lstm.parameters(): p.requires_grad = False
-        for p in ensemble.trf.parameters(): p.requires_grad = False
-        # Fine‑tune only weights
-        ensemble.train()
-        opt_ens = optim.Adam([ensemble.weights], lr=1e-2)
-        for _ in range(20):
-            total = 0.0
-            for Xb, yb in loader:
-                Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
-                opt_ens.zero_grad()
-                preds = ensemble(Xb)
-                loss = F.binary_cross_entropy(preds, yb)
-                loss.backward()
-                opt_ens.step()
-                total += loss.item() * Xb.size(0)
-        torch.save(ensemble.state_dict(), ENSEMBLE_PATH)
-        model_name = "ensemble"
-    else:
-        # Save single model
-        path = os.path.join(MODEL_DIR, f"{opts.modelType}.pt")
-        torch.save(eval(opts.modelType).state_dict(), path)
-        model_name = opts.modelType
+    train_stack = np.vstack(train_raw).astype(np.float64, copy=False)
+    mu1 = train_stack.mean(axis=0).astype(np.float32)
+    sd1 = (train_stack.std(axis=0) + 1e-6).astype(np.float32)
 
     os.makedirs(MODEL_DIR, exist_ok=True)
-    last_training_time = datetime.datetime.utcnow().isoformat()
+    with open(os.path.join(MODEL_DIR, "feat_stats.json"), "w") as f:
+        import json; json.dump({"mean": mu1.tolist(), "std": sd1.tolist()}, f)
 
-    toc = (time.time() - tic) * 1000
-    return TrainingResponse(
-        status="success",
-        message=f"Modelo {model_name} entrenado correctamente",
-        trainingId=f"train_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
-        metrics=TrainingMetrics(),  # Métricas reales se pueden añadir vía MLflow / callback.
-        executionTimeMs=toc,
+    train_pairs = [ ((seq - mu1) / sd1).astype(np.float32) for seq in train_raw ]
+    val_pairs   = [ ((seq - mu1) / sd1).astype(np.float32) for seq in val_raw ]
+
+    # DataLoaders
+    ds_tr = SeqDataset(train_pairs)
+    ds_va = SeqDataset(val_pairs)
+
+    loader_tr = DataLoader(ds_tr, batch_size=8, shuffle=True,  collate_fn=pad_collate_forecast)
+    loader_va = DataLoader(ds_va, batch_size=8, shuffle=False, collate_fn=pad_collate_forecast)
+
+    input_size = train_pairs[0].shape[1]
+    model = LSTMForecaster(input_size=input_size, hidden=192, num_layers=1).to(DEVICE)
+    opt = optim.AdamW(model.parameters(), lr=LEARNING_RATE_DEFAULT, weight_decay=1e-2)
+    sched = optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=2, min_lr=1e-5)
+
+    best_val = float('inf'); bad = 0; patience = 5
+    for epoch in range(EPOCHS_DEFAULT):
+        # ---- train ----
+        model.train(); tr_loss = 0.0; nbt = 0
+        for X, Y, Lm1 in loader_tr:
+            X, Y, Lm1 = X.to(DEVICE), Y.to(DEVICE), Lm1.to(DEVICE)
+            opt.zero_grad()
+            Yhat = model(X)                                     # (B, Tm1, D)
+            err_t = F.smooth_l1_loss(Yhat, Y, reduction='none').mean(dim=2)  # (B, Tm1)
+            Tm1 = X.size(1)
+            mask = (torch.arange(Tm1, device=DEVICE).unsqueeze(0) < Lm1.unsqueeze(1)).float()
+            loss = (err_t * mask).sum() / mask.sum().clamp_min(1.0)
+            loss.backward(); opt.step()
+            tr_loss += loss.item(); nbt += 1
+
+        # ---- val ----
+        model.eval(); va_loss = 0.0; nbv = 0
+        with torch.no_grad():
+            for X, Y, Lm1 in loader_va:
+                X, Y, Lm1 = X.to(DEVICE), Y.to(DEVICE), Lm1.to(DEVICE)
+                Yhat = model(X)
+                err_t = F.smooth_l1_loss(Yhat, Y, reduction='none').mean(dim=2)
+                Tm1 = X.size(1)
+                mask = (torch.arange(Tm1, device=DEVICE).unsqueeze(0) < Lm1.unsqueeze(1)).float()
+                loss = (err_t * mask).sum() / mask.sum().clamp_min(1.0)
+                va_loss += loss.item(); nbv += 1
+        va_loss /= max(1, nbv); tr_loss /= max(1, nbt)
+        logger.info(f"Epoch {epoch+1}/{EPOCHS_DEFAULT} - Train: {tr_loss:.6f} - Val: {va_loss:.6f}")
+        sched.step(va_loss)
+        if va_loss + 1e-4 < best_val:
+            best_val = va_loss; bad = 0
+            torch.save(model.state_dict(), FORECASTER_PATH)
+        else:
+            bad += 1
+            if bad >= patience: break
+
+    model.load_state_dict(torch.load(FORECASTER_PATH, map_location=DEVICE))
+    model.eval()
+
+    def discharge_p95_forecast(seqs: list[np.ndarray]) -> np.ndarray:
+        vals = []
+        with torch.no_grad():
+            for seq in seqs:
+                if seq.shape[0] < 2:
+                    continue
+                x = torch.from_numpy(seq[:-1]).unsqueeze(0).to(DEVICE)  # (1, T-1, D)
+                y = torch.from_numpy(seq[1:]).unsqueeze(0).to(DEVICE)   # (1, T-1, D)
+                yhat = model(x)
+                e = F.smooth_l1_loss(yhat, y, reduction='none').mean(dim=2).squeeze(0).cpu().numpy()
+                vals.append(np.percentile(e, 95))
+        return np.array(vals, dtype=np.float32)
+
+    neg_p95 = discharge_p95_forecast(val_pairs)
+    finite = np.isfinite(neg_p95)
+    if not finite.all():
+        neg_p95 = neg_p95[finite]
+    if neg_p95.size == 0:
+        raise RuntimeError("Empty validation for tau.")
+
+    # light clamping to avoid p99 coinciding with a single extreme
+    hi = np.quantile(neg_p95, 0.995) if neg_p95.size > 200 else np.quantile(neg_p95, 0.99)
+    neg_p95 = np.clip(neg_p95, None, hi)
+    tau = float(np.quantile(neg_p95, 0.99))
+    np.save(THRESHOLD_PATH, np.array(tau, dtype=np.float32))
+
+    tau_value = tau
+    last_training_time = datetime.datetime.now().isoformat()
+    g_model = model
+    logger.info(
+        f"Training completed in {(time.time() - tic):.2f} s; "
+        f"τ(p99 of p95)={tau:.6f} | neg_p95 stats "
+        f"min/med/p95/p99=({neg_p95.min():.3f}/{np.median(neg_p95):.3f}/"
+        f"{np.percentile(neg_p95,95):.3f}/{np.percentile(neg_p95,99):.3f})"
     )
+    print(f"Updated threshold value: {tau}")
+
+
+@app.post("/train", response_model=StartTrainingResponse)
+async def start_training(req: StartTrainingRequest):
+    global expected_discharges, buffered_discharges
+    if expected_discharges != 0:
+        raise HTTPException(status_code=503, detail="Busy")
+    expected_discharges = req.totalDischarges
+    buffered_discharges = []
+    print(f"Training session started: {expected_discharges} discharges expected")
+    return StartTrainingResponse(expectedDischarges=expected_discharges)
+
+
+@app.post("/train/{ordinal}", response_model=DischargeAck)
+async def push_discharge(ordinal: int, discharge: Discharge, background_tasks: BackgroundTasks):
+    global expected_discharges, buffered_discharges
+    if expected_discharges == 0:
+        raise HTTPException(status_code=400, detail="Session not started")
+    if ordinal < 1 or ordinal > expected_discharges:
+        raise HTTPException(status_code=400, detail="Invalid ordinal")
+    buffered_discharges.append(discharge)
+    ack = DischargeAck(ordinal=ordinal, totalDischarges=expected_discharges)
+    if ordinal == expected_discharges:
+        background_tasks.add_task(run_training_job, buffered_discharges.copy())
+        expected_discharges = 0
+        buffered_discharges = []
+    return ack
+
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict_api(req: PredictionRequest):
-    if ensemble is None and not os.path.exists(ENSEMBLE_PATH):
-        raise HTTPException(status_code=400, detail="Modelo no entrenado. Llama primero /train")
+async def predict_api(discharge: Discharge):
+    global g_model, tau_value
 
-    # Lazy load
-    global ensemble
-    if ensemble is None:
-        cnn = DilatedCNN().to(DEVICE)
-        lstm = BiLSTMAttn().to(DEVICE)
-        trf = TimeSeriesTransformer().to(DEVICE)
-        ensemble = Ensemble(cnn, lstm, trf).to(DEVICE)
-        ensemble.load_state_dict(torch.load(ENSEMBLE_PATH, map_location=DEVICE))
-        ensemble.eval()
+    if tau_value is None and os.path.exists(THRESHOLD_PATH):
+        tau_value = float(np.load(THRESHOLD_PATH))
+        print("pre-computed threshold value loaded")
+    if g_model is None or tau_value is None:
+        raise HTTPException(status_code=400, detail="Model not trained")
 
     tic = time.time()
-    scaler_map = build_scalers(req.discharges)
-    X, _ = prepare_windows(req.discharges, scaler_map)
-    with torch.no_grad():
-        preds = torch.sigmoid(ensemble(torch.from_numpy(X).to(DEVICE))).cpu().numpy()
-    mean_score = preds.mean()
 
-    toc = (time.time() - tic) * 1000
+    raw = np.stack([np.asarray(s.values, dtype=np.float32) for s in discharge.signals])  # (7,T)
+    feats, prev = [], None
+    for start in range(0, raw.shape[1] - WINDOW_SIZE + 1, max(1, WINDOW_SIZE)):
+        f, prev = extract_aux_features(raw[:, start:start+WINDOW_SIZE], prev)
+        feats.append(f)
+    if len(feats) == 0:
+        raise HTTPException(status_code=400, detail="No valid windows")
+
+    import json
+    stats_path = os.path.join(MODEL_DIR, "feat_stats.json")
+    with open(stats_path, "r") as f:
+        st = json.load(f)
+    mu = np.array(st["mean"], dtype=np.float32); sd = np.array(st["std"], dtype=np.float32)
+    seq = ((np.stack(feats).astype(np.float32) - mu) / sd).astype(np.float32)  # (Nw, D)
+
+    if seq.shape[0] <= FORECAST_H:
+        raise HTTPException(status_code=400, detail="Sequence too short for forecasting.")
+
+    x = torch.from_numpy(seq[:-FORECAST_H]).unsqueeze(0).to(DEVICE)
+    y = torch.from_numpy(seq[FORECAST_H:]).unsqueeze(0).to(DEVICE)
+    yhat = g_model(x)
+    err = F.smooth_l1_loss(yhat, y, reduction='none').mean(dim=2).squeeze(0).cpu().numpy()
+
+    if g_model is None and os.path.exists(FORECASTER_PATH):
+        g_model = LSTMForecaster(input_size=seq.shape[1], hidden=192, num_layers=1).to(DEVICE)
+        g_model.load_state_dict(torch.load(FORECASTER_PATH, map_location=DEVICE))
+        g_model.eval()
+        print("pre-trained forecaster model loaded")
+
+    if g_model is None:
+        raise HTTPException(status_code=503, detail="Model not trained (weights missing)")
+
+    if getattr(g_model.proj, "out_features", None) != seq.shape[1]:
+        raise HTTPException(status_code=500, detail="Feature dimension mismatch; retrain forecaster.")
+
+    with torch.no_grad():
+        if seq.shape[0] < 2:
+            raise HTTPException(status_code=400, detail="Sequence too short for prediction")
+        x = torch.from_numpy(seq[:-1]).unsqueeze(0).to(DEVICE)
+        y = torch.from_numpy(seq[1:]).unsqueeze(0).to(DEVICE)
+        yhat = g_model(x)
+        err = F.smooth_l1_loss(yhat, y, reduction='none').mean(dim=2).squeeze(0).cpu().numpy()  # (T-1,)
+
+    if err.shape[0] >= WARMUP_WINDOWS:
+        err[:WARMUP_WINDOWS] = 0.0
+
+    shot_p95 = float(np.percentile(err, 95))
+    is_anom  = (shot_p95 >= tau_value)
+    ratio    = shot_p95 / (tau_value + 1e-8)
+    conf     = float(np.clip(ratio if is_anom else 1.0 - ratio, 0.0, 1.0))
+
+    # alinear a Nw ventanas
+    err_aligned = np.concatenate([err, np.repeat(err[-1], FORECAST_H)], axis=0)  # mismo largo que ventanas
+    ratio_win   = err_aligned / (tau_value + 1e-8)
+    probs       = np.clip(ratio_win, 0.0, 1.0)
+
+    windows = [
+        WindowProperties(
+            featureValues=seq[i].tolist(),
+            prediction=("Anomaly" if ratio_win[i] >= WINDOW_ANOM_FACTOR else "Normal"),
+            justification=float(probs[i])
+        )
+        for i in range(len(probs))
+    ]
+
+    exec_ms = (time.time() - tic) * 1000.0
     return PredictionResponse(
-        prediction=int(mean_score > 0.5),
-        confidence=float(mean_score if mean_score > 0.5 else 1 - mean_score),
-        executionTimeMs=toc,
-        model="ensemble",
-        details={"windows": len(preds)}
+        prediction=("Anomaly" if is_anom else "Normal"),
+        confidence=conf,
+        executionTimeMs=exec_ms,
+        model="lstm_forecaster_features",
+        windowSize=WINDOW_SIZE,
+        windows=windows
     )
 
-import psutil
 
 @app.get("/health", response_model=HealthCheckResponse)
 async def health_api():
-    mem = psutil.virtual_memory()
     return HealthCheckResponse(
-        status="online" if os.path.exists(ENSEMBLE_PATH) else "degraded",
-        version="2.0.0",
+        name=MODEL_NAME,
         uptime=time.time() - start_time,
-        memory=MemoryInfo(total=mem.total / 1_048_576, used=mem.used / 1_048_576),
-        load=psutil.cpu_percent() / 100,
-        lastTraining=last_training_time,
+        lastTraining=last_training_time or ""
     )
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8002, reload=True,
-                limit_concurrency=50, limit_max_requests=20_000, timeout_keep_alive=120)
+    uvicorn.run("main:app", host="0.0.0.0", port=8002)
